@@ -78,7 +78,8 @@ and invoke it later with a method. Nothing needs a special keyword.
 | `charter`  | `charter { rules:, hooks:, skills:, commands: }` | (definition — intaken by a harness) |
 | `harness`  | `harness { charter:, graph: }` | `.invoke` `.trigger` `.command` `.skill` (graph-backed) |
 | `agent`    | `agent { model:, system:, harness: }` | `.run` `.ask` `.invoke` `.use` `.delegate` `.fan_out` |
-| `subagent` | `subagent { name:, description:, model:, system: }` | `.run` `.delegate`-target |
+| `subagent` | `subagent { name:, description:, model:, system:, tools: }` | `.run` `.delegate`-target |
+| `tool`     | `tool { name:, description:, run: }` | model calls it during a run; `.run` directly |
 | `rule`     | `rule { name:, text: }` | (data — folded into a charter) |
 | `skill`    | `skill { name:, description:, instructions: }` | `.use` on an agent |
 | `hook`     | `hook { on:, do: }` | (data — folded into a charter/agent) |
@@ -135,8 +136,27 @@ translator = subagent {
   name: "translator",
   description: "Use to translate text into French",
   model: "gpt-4o-mini",
-  system: "Translate to French. Output only the translation."
+  system: "Translate to French. Output only the translation.",
+  tools: [dictionary]        # subagents (and agents) can carry tools
 }
+```
+
+### tool
+
+A callable the model may invoke mid-run via OpenAI function calling. `run:` is a
+function taking the tool's string input. Attach with `tools:` on an agent or
+subagent; the run loops until the model produces a final answer.
+
+```ruby
+shout = tool {
+  name: "shout",
+  description: "Convert text to UPPERCASE. Use when asked to shout.",
+  run: def (text) return text.upcase end
+}
+
+crier = agent { model: "gpt-4o-mini", system: "Call shout when asked.", tools: [shout] }
+crier.run("Please shout: hello")   # model calls shout, result fed back -> HELLO
+shout.run("direct")                # tools are also callable directly -> DIRECT
 ```
 
 ### rule / skill / hook / command

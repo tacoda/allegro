@@ -5,7 +5,7 @@ use std::rc::Rc;
 use crate::openai::Agent;
 use crate::value::{
     AgentObj, Charter, Command, Env, Factory, Graph, Harness, Hook, HookEvent, HookResult, Message,
-    ModelObj, Rule, Skill, Subagent, Value,
+    ModelObj, Rule, Skill, Subagent, Tool, Value,
 };
 
 pub fn register(env: &Env) {
@@ -29,6 +29,7 @@ pub fn register(env: &Env) {
     e.define("model", Value::Builtin("model", b_model));
     e.define("agent", Value::Builtin("agent", b_agent));
     e.define("subagent", Value::Builtin("subagent", b_subagent));
+    e.define("tool", Value::Builtin("tool", b_tool));
     e.define("rule", Value::Builtin("rule", b_rule));
     e.define("skill", Value::Builtin("skill", b_skill));
     e.define("hook", Value::Builtin("hook", b_hook));
@@ -47,6 +48,7 @@ pub(crate) fn make(kind: &str, cfg: Value) -> Result<Value, String> {
         "model" => b_model(&args),
         "agent" => b_agent(&args),
         "subagent" => b_subagent(&args),
+        "tool" => b_tool(&args),
         "rule" => b_rule(&args),
         "skill" => b_skill(&args),
         "hook" => b_hook(&args),
@@ -184,6 +186,11 @@ pub(crate) fn build_agent(cfg: &HashMap<String, Value>) -> Result<Value, String>
         }
     }
 
+    let tools: Vec<Rc<Tool>> = value_list(cfg.get("tools"))
+        .into_iter()
+        .filter_map(|v| if let Value::Tool(t) = v { Some(t) } else { None })
+        .collect();
+
     // Subagents this agent can delegate to, keyed by name.
     let mut subagents: Vec<(String, Value)> = Vec::new();
     for v in value_list(cfg.get("subagents")).into_iter().chain(value_list(cfg.get("agents"))) {
@@ -206,7 +213,22 @@ pub(crate) fn build_agent(cfg: &HashMap<String, Value>) -> Result<Value, String>
         before,
         after,
         skills,
+        tools,
         subagents,
+    })))
+}
+
+fn b_tool(args: &[Value]) -> Result<Value, String> {
+    let h = cfg(args, "tool")?.borrow();
+    let action = h
+        .get("run")
+        .or_else(|| h.get("do"))
+        .cloned()
+        .ok_or("tool needs a 'run:' function")?;
+    Ok(Value::Tool(Rc::new(Tool {
+        name: get_str(&h, "name", "tool"),
+        description: get_str(&h, "description", ""),
+        action,
     })))
 }
 

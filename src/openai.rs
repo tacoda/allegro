@@ -3,6 +3,19 @@ use std::thread;
 use reqwest::blocking::Client;
 use serde_json::{json, Value as Json};
 
+// A tool call the model requested during a completion.
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+// The assistant's reply: free-text content and/or tool calls to run.
+pub struct Reply {
+    pub content: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+}
+
 pub struct Agent {
     pub model: String,
     pub system: String,
@@ -44,6 +57,60 @@ impl Agent {
             user,
             self.temperature,
         )
+    }
+
+    // One chat round-trip with an explicit message history and optional tool
+    // specs. Returns the assistant's content and/or the tool calls it requested.
+    pub fn complete(&self, messages: &[Json], tools: &[Json]) -> Result<Reply, String> {
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+        });
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+        }
+
+        let resp = self
+            .client
+            .post("https://api.openai.com/v1/chat/completions")
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .map_err(|e| format!("request failed: {}", e))?;
+
+        let status = resp.status();
+        let json: Json = resp
+            .json()
+            .map_err(|e| format!("invalid response body: {}", e))?;
+        if !status.is_success() {
+            let msg = json["error"]["message"].as_str().unwrap_or("unknown error");
+            return Err(format!("OpenAI API error ({}): {}", status, msg));
+        }
+
+        let message = &json["choices"][0]["message"];
+        let content = message["content"].as_str().map(|s| s.to_string());
+        let mut tool_calls = Vec::new();
+        if let Some(arr) = message["tool_calls"].as_array() {
+            for tc in arr {
+                tool_calls.push(ToolCall {
+                    id: tc["id"].as_str().unwrap_or_default().to_string(),
+                    name: tc["function"]["name"].as_str().unwrap_or_default().to_string(),
+                    arguments: tc["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("{}")
+                        .to_string(),
+                });
+            }
+        }
+        Ok(Reply {
+            content,
+            tool_calls,
+        })
+    }
+
+    pub fn system(&self) -> &str {
+        &self.system
     }
 
     // Run this agent over many inputs concurrently — one request per input.

@@ -20,6 +20,7 @@ pub enum Value {
     Model(Rc<ModelObj>),
     Agent(Rc<AgentObj>),
     Subagent(Rc<Subagent>),
+    Tool(Rc<Tool>),
     Rule(Rc<Rule>),
     Skill(Rc<Skill>),
     Hook(Rc<Hook>),
@@ -60,6 +61,14 @@ pub struct ModelObj {
     pub temperature: f64,
 }
 
+// A callable the model can invoke during a run (OpenAI function calling).
+// `action` is a function that takes the tool's string input and returns a result.
+pub struct Tool {
+    pub name: String,
+    pub description: String,
+    pub action: Value,
+}
+
 // A configured agent: an LLM core plus the harness machinery wrapped around it.
 pub struct AgentObj {
     pub name: String,
@@ -67,6 +76,7 @@ pub struct AgentObj {
     pub before: Vec<Value>,          // hook functions run on input
     pub after: Vec<Value>,           // hook functions run on output
     pub skills: Vec<Rc<Skill>>,      // named capabilities
+    pub tools: Vec<Rc<Tool>>,        // callables the model may invoke
     pub subagents: Vec<(String, Value)>, // delegates, keyed by name
 }
 
@@ -204,6 +214,7 @@ impl Value {
             Value::Model(_) => "model",
             Value::Agent(_) => "agent",
             Value::Subagent(_) => "subagent",
+            Value::Tool(_) => "tool",
             Value::Rule(_) => "rule",
             Value::Skill(_) => "skill",
             Value::Hook(_) => "hook",
@@ -258,6 +269,7 @@ impl fmt::Display for Value {
             Value::Model(m) => write!(f, "#<model {}/{}>", m.provider, m.name),
             Value::Agent(a) => write!(f, "#<agent {} model={}>", a.name, a.core.model),
             Value::Subagent(s) => write!(f, "#<subagent {}>", s.name),
+            Value::Tool(t) => write!(f, "#<tool {}>", t.name),
             Value::Rule(r) => write!(f, "#<rule {}>", r.name),
             Value::Skill(s) => write!(f, "#<skill {}>", s.name),
             Value::Hook(h) => {

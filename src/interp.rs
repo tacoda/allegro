@@ -4,8 +4,12 @@ use std::rc::Rc;
 
 use crate::ast::{BinOp, Expr, Pattern, Stmt, UnOp};
 use crate::builtins;
+use serde_json::json;
+
+use crate::openai::ToolCall;
 use crate::value::{
-    new_env, AgentObj, Class, Command, Env, Factory, Func, Graph, Harness, Message, Skill, Value,
+    new_env, AgentObj, Class, Command, Env, Factory, Func, Graph, Harness, Message, Skill, Tool,
+    Value,
 };
 
 // Control-flow signal so `return` can unwind through blocks.
@@ -385,6 +389,7 @@ impl Interp {
         match target {
             Value::Agent(a) => self.agent_method(&a, name, argv),
             Value::Subagent(s) => self.subagent_method(&s, name, argv),
+            Value::Tool(t) => self.tool_method(&t, name, argv),
             Value::Command(c) => self.command_method(&c, name, argv),
             Value::Graph(g) => self.graph_method(&g, name, argv),
             Value::Factory(fac) => self.factory_method(&fac, name, argv),
@@ -408,7 +413,11 @@ impl Interp {
             text = val.to_string();
         }
 
-        let content = agent.core.run(&text)?;
+        let content = if agent.tools.is_empty() {
+            agent.core.run(&text)?
+        } else {
+            self.run_with_tools(agent, &text)?
+        };
         let mut msg = make_message(content, &agent.name);
 
         for hook in &agent.after.clone() {
@@ -431,6 +440,85 @@ impl Interp {
         match result {
             Value::HookResult(r) => Ok((r.value.clone(), r.halt)),
             other => Ok((other, false)),
+        }
+    }
+
+    // Run an agent that has tools: loop chat completions, executing any tool
+    // calls the model requests and feeding results back until it answers.
+    fn run_with_tools(&mut self, agent: &Rc<AgentObj>, input: &str) -> Result<String, String> {
+        let specs = tool_specs(&agent.tools);
+        let mut messages: Vec<serde_json::Value> = Vec::new();
+        let sys = agent.core.system();
+        if !sys.is_empty() {
+            messages.push(json!({ "role": "system", "content": sys }));
+        }
+        messages.push(json!({ "role": "user", "content": input }));
+
+        for _ in 0..8 {
+            let reply = agent.core.complete(&messages, &specs)?;
+            if reply.tool_calls.is_empty() {
+                return reply
+                    .content
+                    .ok_or_else(|| "no content in OpenAI response".to_string());
+            }
+            let calls: Vec<serde_json::Value> = reply
+                .tool_calls
+                .iter()
+                .map(|c| {
+                    json!({
+                        "id": c.id,
+                        "type": "function",
+                        "function": { "name": c.name, "arguments": c.arguments }
+                    })
+                })
+                .collect();
+            messages.push(json!({
+                "role": "assistant",
+                "content": reply.content,
+                "tool_calls": calls
+            }));
+            for call in &reply.tool_calls {
+                let result = self.invoke_tool(agent, call)?;
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": result
+                }));
+            }
+        }
+        Err("tool loop exceeded 8 rounds".into())
+    }
+
+    fn invoke_tool(&mut self, agent: &Rc<AgentObj>, call: &ToolCall) -> Result<String, String> {
+        let tool = agent
+            .tools
+            .iter()
+            .find(|t| t.name == call.name)
+            .cloned()
+            .ok_or_else(|| format!("model called unknown tool '{}'", call.name))?;
+        // Tools take a single `input` string argument.
+        let args: serde_json::Value =
+            serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
+        let input = args
+            .get("input")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| call.arguments.clone());
+        let out = self.apply(tool.action.clone(), vec![Value::Str(input)])?;
+        Ok(out.to_string())
+    }
+
+    fn tool_method(
+        &mut self,
+        tool: &Rc<Tool>,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, String> {
+        match name {
+            "run" | "call" | "invoke" => self.apply(tool.action.clone(), args),
+            "name" => Ok(Value::Str(tool.name.clone())),
+            "description" => Ok(Value::Str(tool.description.clone())),
+            _ => Err(format!("tool has no method '{}'", name)),
         }
     }
 
@@ -820,6 +908,30 @@ impl Interp {
             }
         }
     }
+}
+
+// Build OpenAI function specs for an agent's tools. Each tool takes one
+// string argument named `input`.
+fn tool_specs(tools: &[Rc<Tool>]) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "input": { "type": "string", "description": "input to the tool" }
+                        },
+                        "required": ["input"]
+                    }
+                }
+            })
+        })
+        .collect()
 }
 
 fn make_message(content: String, from: &str) -> Value {
