@@ -74,16 +74,22 @@ and invoke it later with a method. Nothing needs a special keyword.
 
 | Primitive | Constructor | Invoke with |
 |-----------|-------------|-------------|
-| `model`   | `model { provider:, name:, temperature: }` | (data — passed to an agent) |
-| `agent`   | `agent { model:, system:, … }` | `.run` `.ask` `.use` `.delegate` `.fan_out` |
-| `rule`    | `rule { name:, text: }` | (data — folded into an agent/charter) |
-| `skill`   | `skill { name:, description:, instructions: }` | `.use` on an agent |
-| `hook`    | `hook { on:, do: }` | attached to an agent or charter |
-| `command` | `command { name:, run: }` | `.run` `.call` `.invoke` |
-| `charter` | `charter { rules:, hooks:, skills:, commands: }` | (definition — input to a harness) |
-| `harness` | `harness { agent:, charter:, graph: }` | `.invoke` `.run` `.trigger` `.command` `.skill` |
-| `graph`   | `graph { entry:, nodes:, edges: }` | `.invoke` `.trigger` `.run` |
-| `factory` | `factory { build: }` | `.create` `.build` `.make` |
+| `model`    | `model { provider:, name:, temperature: }` | (data — passed to an agent) |
+| `charter`  | `charter { rules:, hooks:, skills:, commands: }` | (definition — intaken by a harness) |
+| `harness`  | `harness { charter:, graph: }` | `.invoke` `.trigger` `.command` `.skill` (graph-backed) |
+| `agent`    | `agent { model:, system:, harness: }` | `.run` `.ask` `.invoke` `.use` `.delegate` `.fan_out` |
+| `subagent` | `subagent { name:, description:, model:, system: }` | `.run` `.delegate`-target |
+| `rule`     | `rule { name:, text: }` | (data — folded into a charter) |
+| `skill`    | `skill { name:, description:, instructions: }` | `.use` on an agent |
+| `hook`     | `hook { on:, do: }` | (data — folded into a charter/agent) |
+| `command`  | `command { name:, run: }` | `.run` `.call` `.invoke` |
+| `graph`    | `graph { entry:, nodes:, edges: }` | `.invoke` `.trigger` `.run` |
+| `factory`  | `factory { build: }` | `.create` `.build` `.make` |
+
+The composition is **`charter → harness → agent`**: a charter bundles governance,
+a harness intakes a charter (and may carry a graph), and an **agent is a harness
+plus a model**. Agents delegate to **subagents** — named, described worker agents
+(the Claude Code "agent" primitive).
 
 ### model
 
@@ -96,24 +102,41 @@ fast = model { provider: "openai", name: "gpt-4o-mini", temperature: 0.2 }
 bot  = agent { model: fast, system: "..." }
 ```
 
-### agent
+### agent (= harness + model)
+
+An agent combines a model with a harness (its governance) and can delegate to
+subagents.
 
 ```ruby
 bot = agent {
   name: "bot",
-  model: "gpt-4o-mini",
+  model: fast,              # a model primitive or a string
   system: "You are helpful.",
   temperature: 0.2,
-  rules:  [concise],        # appended to the system prompt
-  skills: [summarize],      # available via .use
-  hooks:  [redact, loud],   # wrap every run
-  agents: [translator]      # sub-agents, reachable via .delegate
+  harness: gov,             # governance: rules/hooks/skills from its charter
+  subagents: [translator]   # delegates, reachable via .delegate
 }
 
-bot.run("...")                      # -> Message
+bot.invoke("...")                   # -> Message  (alias: .run / .ask)
 bot.use(summarize, "...")           # run with a skill's instructions prepended
-bot.delegate("translator", "...")   # hand off to a named sub-agent
+bot.delegate("translator", "...")   # hand off to a named subagent
 bot.fan_out(["a", "b"])             # run over many inputs concurrently -> [Message]
+```
+
+Rules, hooks, and skills can also be passed inline (`rules:`, `hooks:`, `skills:`)
+instead of through a harness — they end up in the same place.
+
+### subagent
+
+A named, described worker an agent delegates to.
+
+```ruby
+translator = subagent {
+  name: "translator",
+  description: "Use to translate text into French",
+  model: "gpt-4o-mini",
+  system: "Translate to French. Output only the translation."
+}
 ```
 
 ### rule / skill / hook / command
@@ -139,8 +162,8 @@ brief.run("the ocean")
 ### charter + harness
 
 A **charter** is a pure bundle of rules, hooks, skills, and commands. A **harness**
-ties a charter to an agent (or a graph) and runs it — applying the charter's rules
-and hooks around each invocation.
+intakes a charter (and may carry a graph). Give a harness a model and you have an
+agent; give it a graph and it runs on its own.
 
 ```ruby
 governance = charter {
@@ -150,9 +173,16 @@ governance = charter {
   commands: [brief]
 }
 
-h = harness { agent: bot, charter: governance }
-h.invoke("What is Rust good at?")   # rules + hooks applied
-h.command("brief").run("the sea")   # reach into the charter
+gov = harness { charter: governance }
+gov.command("brief").run("the sea")   # reach into the charter
+
+# a harness + a model = an agent
+assistant = agent { model: "gpt-4o-mini", harness: gov }
+assistant.invoke("What is Rust good at?")   # rules + hooks applied
+
+# a harness with a graph is invocable on its own
+router = harness { graph: flow }
+router.trigger("some input")
 ```
 
 ### graph
@@ -192,27 +222,27 @@ Subclass any primitive to define your own reusable workflow. A class supplies a
 `self.base` reaches the underlying primitive; undefined methods delegate to it.
 
 ```ruby
-class ReviewFlow < harness
+class Desk < agent
   def config
-    return { agent: reviewer, charter: house_rules }
+    return { model: "gpt-4o-mini", system: "...", subagents: [translator] }
   end
 
   def init            # runs on .new
-    @reviews = 0
+    @handled = 0
   end
 
-  def review(text)    # domain method wrapping the inherited .invoke
-    @reviews = @reviews + 1
-    return self.invoke("Review this: " + text)
+  def handle(text)    # domain method wrapping the inherited .invoke
+    @handled = @handled + 1
+    return self.invoke(text)
   end
 end
 
-flow = ReviewFlow.new
-flow.review("let x = 1")
+desk = Desk.new
+desk.handle("hello")
 
-class StrictReview < ReviewFlow      # class-to-class inheritance
-  def review(text)
-    return self.invoke("Be harsh. " + text)
+class TerseDesk < Desk               # class-to-class inheritance
+  def handle(text)
+    return self.invoke("In three words: " + text)
   end
 end
 ```

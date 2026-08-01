@@ -3,7 +3,8 @@ use crate::token::Tok;
 
 // Type names usable as `when` patterns.
 const TYPE_NAMES: &[&str] = &[
-    "Nil", "Bool", "Number", "String", "Array", "Hash", "Model", "Agent", "Rule", "Skill", "Hook",
+    "Nil", "Bool", "Number", "String", "Array", "Hash", "Model", "Agent", "Subagent", "Rule",
+    "Skill", "Hook",
     "Command", "Graph", "Factory", "Charter", "Harness", "Class", "Instance", "Message",
     "HookResult", "Function",
 ];

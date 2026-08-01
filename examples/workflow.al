@@ -1,46 +1,55 @@
-# Custom workflows are defined by subclassing a primitive. A class supplies a
-# `config` for the base primitive, adds methods, and keeps state in @ivars.
+# Custom workflows: subclass a primitive, supply a `config`, add methods, keep
+# state in @ivars. Here an agent (= harness + model) delegates to a subagent.
 
-# A reusable review harness: subclass `harness`, give it a charter + agent,
-# and add a domain method.
-class ReviewFlow < harness
+# A subagent is a named delegate with a description of when to use it
+# (the Claude Code "agent" primitive).
+translator = subagent {
+  name: "translator",
+  description: "Use to translate text into French",
+  model: "gpt-4o-mini",
+  system: "Translate the input to French. Output only the translation.",
+  temperature: 0.0
+}
+
+# A front desk: subclass `agent`, wire in the subagent, add domain methods.
+class Desk < agent
   def config
-    reviewer = agent {
-      name: "reviewer",
+    return {
       model: "gpt-4o-mini",
-      system: "You review text. Reply with one concrete suggestion.",
-      temperature: 0.2
+      system: "You are a concise front desk. One sentence.",
+      subagents: [translator]
     }
-    rules = charter { rules: [ rule { name: "short", text: "One sentence." } ] }
-    return { agent: reviewer, charter: rules }
   end
 
   def init
-    @reviews = 0
+    @handled = 0
   end
 
-  # Domain method: wraps the inherited `invoke`.
-  def review(text)
-    @reviews = @reviews + 1
-    return self.invoke("Review this: " + text)
+  def handle(text)
+    @handled = @handled + 1
+    return self.invoke(text)
+  end
+
+  def to_french(text)
+    return self.delegate("translator", text)
   end
 
   def count
-    return @reviews
+    return @handled
   end
 end
 
-flow = ReviewFlow.new
-puts flow.review("fn add(a,b){a+b}").content
-puts flow.review("let x = 1").content
-puts "reviews run: " + str(flow.count)
+desk = Desk.new
+puts desk.handle("What is the capital of France?").content
+puts desk.to_french("Good morning, friend.").content
+puts "handled: " + str(desk.count)
 
-# Inheritance: specialize the workflow further.
-class StrictReview < ReviewFlow
-  def review(text)
-    return self.invoke("Be harsh. Review this: " + text)
+# Inheritance: specialize the workflow.
+class TerseDesk < Desk
+  def handle(text)
+    return self.invoke("In three words: " + text)
   end
 end
 
-strict = StrictReview.new
-puts strict.review("x = x").content
+td = TerseDesk.new
+puts td.handle("Describe the weather.").content

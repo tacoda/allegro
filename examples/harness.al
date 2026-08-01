@@ -1,6 +1,5 @@
-# Build up definitions (rules, skills, hooks, commands), bundle them in a
-# charter, then run them through a harness. Agents are constructors too; everything
-# else is a plain constructor.
+# A charter is a bundle of governance (rules, hooks, skills, commands).
+# A harness intakes a charter. An agent is a harness plus a model.
 
 # --- charter parts: pure definitions ---
 concise = rule { name: "concise", text: "Answer in one short sentence." }
@@ -29,7 +28,7 @@ brief = command {
   end
 }
 
-# --- charter: the definition, input to a harness ---
+# --- charter: the governance definition ---
 governance = charter {
   rules: [concise],
   skills: [summarize],
@@ -37,31 +36,35 @@ governance = charter {
   commands: [brief]
 }
 
-# --- agent: a plain constructor now ---
+# --- harness: intakes the charter ---
+gov = harness { charter: governance }
+
+# --- agent: a harness plus a model ---
 assistant = agent {
   name: "assistant",
   model: "gpt-4o-mini",
-  temperature: 0.2
+  temperature: 0.2,
+  harness: gov
 }
 
-# --- harness: ties an agent to a charter, then is invoked ---
-h = harness { agent: assistant, charter: governance }
+# invoking the agent applies the charter's rules and hooks
+puts "reply: " + assistant.invoke("What is Rust good at?").content
 
-puts "reply: " + h.invoke("What is Rust good at?").content
-
-# hooks short-circuit the LLM entirely
-puts "safe:  " + h.invoke("my password is hunter2").content
+# the redact hook short-circuits the LLM entirely
+puts "safe:  " + assistant.invoke("my password is hunter2").content
 
 # reach into the charter through the harness
-puts "cmd:   " + h.command("brief").run("the ocean")
+puts "cmd:   " + gov.command("brief").run("the ocean")
 
-# --- graph: define steps, then trigger ---
+# --- a harness can also carry a graph and run on its own ---
 classify = agent { name: "classify", model: "gpt-4o-mini", system: "Reply with ONE word: QUESTION or STATEMENT.", temperature: 0.0 }
 
-flow = graph {
-  entry: "classify",
-  nodes: { classify: classify },
-  edges: { classify: "end" }
+flow = harness {
+  graph: graph {
+    entry: "classify",
+    nodes: { classify: classify },
+    edges: { classify: "end" }
+  }
 }
 
 label = flow.trigger("Is the sky blue?").content

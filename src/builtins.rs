@@ -5,7 +5,7 @@ use std::rc::Rc;
 use crate::openai::Agent;
 use crate::value::{
     AgentObj, Charter, Command, Env, Factory, Graph, Harness, Hook, HookEvent, HookResult, Message,
-    ModelObj, Rule, Skill, Value,
+    ModelObj, Rule, Skill, Subagent, Value,
 };
 
 pub fn register(env: &Env) {
@@ -28,6 +28,7 @@ pub fn register(env: &Env) {
     // primitive constructors — built up as definitions, then invoked
     e.define("model", Value::Builtin("model", b_model));
     e.define("agent", Value::Builtin("agent", b_agent));
+    e.define("subagent", Value::Builtin("subagent", b_subagent));
     e.define("rule", Value::Builtin("rule", b_rule));
     e.define("skill", Value::Builtin("skill", b_skill));
     e.define("hook", Value::Builtin("hook", b_hook));
@@ -45,6 +46,7 @@ pub(crate) fn make(kind: &str, cfg: Value) -> Result<Value, String> {
     match kind {
         "model" => b_model(&args),
         "agent" => b_agent(&args),
+        "subagent" => b_subagent(&args),
         "rule" => b_rule(&args),
         "skill" => b_skill(&args),
         "hook" => b_hook(&args),
@@ -95,6 +97,24 @@ fn b_agent(args: &[Value]) -> Result<Value, String> {
     build_agent(&h)
 }
 
+// A subagent wraps a worker agent with a name and a "when to use" description.
+// It either adopts an existing agent (`agent:`) or builds one from the config.
+fn b_subagent(args: &[Value]) -> Result<Value, String> {
+    let h = cfg(args, "subagent")?.borrow();
+    let agent = match h.get("agent") {
+        Some(v @ Value::Agent(_)) => v.clone(),
+        Some(other) => {
+            return Err(format!("subagent 'agent:' must be an agent, got {}", other.type_name()))
+        }
+        None => build_agent(&h)?,
+    };
+    Ok(Value::Subagent(Rc::new(Subagent {
+        name: get_str(&h, "name", "subagent"),
+        description: get_str(&h, "description", ""),
+        agent,
+    })))
+}
+
 // Assemble an agent: compose its system prompt from the base system plus any
 // attached rules and skills, and wire up hooks and sub-agents.
 pub(crate) fn build_agent(cfg: &HashMap<String, Value>) -> Result<Value, String> {
@@ -110,23 +130,53 @@ pub(crate) fn build_agent(cfg: &HashMap<String, Value>) -> Result<Value, String>
         _ => model_temp,
     };
 
-    let mut system = cfg.get("system").map(|v| v.to_string()).unwrap_or_default();
-    let rule_texts: Vec<String> = value_list(cfg.get("rules"))
-        .iter()
-        .filter_map(|v| match v {
-            Value::Rule(r) => Some(format!("- {}", r.text)),
-            _ => None,
-        })
-        .collect();
-    if !rule_texts.is_empty() {
-        system.push_str("\n\n# Rules\n");
-        system.push_str(&rule_texts.join("\n"));
+    // Governance (rules, hooks, skills) comes from an attached harness or
+    // charter, plus any inline config — an agent is a harness plus a model.
+    let mut rules: Vec<Rc<Rule>> = Vec::new();
+    let mut skills: Vec<Rc<Skill>> = Vec::new();
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+
+    let mut charters: Vec<Rc<Charter>> = Vec::new();
+    if let Some(Value::Harness(h)) = cfg.get("harness") {
+        if let Some(c) = &h.charter {
+            charters.push(c.clone());
+        }
+    }
+    if let Some(Value::Charter(c)) = cfg.get("charter") {
+        charters.push(c.clone());
+    }
+    for c in &charters {
+        rules.extend(c.rules.iter().cloned());
+        skills.extend(c.skills.iter().cloned());
+        before.extend(c.before.iter().cloned());
+        after.extend(c.after.iter().cloned());
+    }
+    // inline rules/skills/hooks
+    for v in value_list(cfg.get("rules")) {
+        if let Value::Rule(r) = v {
+            rules.push(r);
+        }
+    }
+    for v in value_list(cfg.get("skills")) {
+        if let Value::Skill(s) = v {
+            skills.push(s);
+        }
+    }
+    for v in value_list(cfg.get("hooks")) {
+        if let Value::Hook(hook) = &v {
+            match hook.event {
+                HookEvent::BeforeRun => before.push(v),
+                HookEvent::AfterRun => after.push(v),
+            }
+        }
     }
 
-    let skills: Vec<Rc<Skill>> = value_list(cfg.get("skills"))
-        .into_iter()
-        .filter_map(|v| if let Value::Skill(s) = v { Some(s) } else { None })
-        .collect();
+    let mut system = cfg.get("system").map(|v| v.to_string()).unwrap_or_default();
+    if !rules.is_empty() {
+        system.push_str("\n\n# Rules\n");
+        let lines: Vec<String> = rules.iter().map(|r| format!("- {}", r.text)).collect();
+        system.push_str(&lines.join("\n"));
+    }
     if !skills.is_empty() {
         system.push_str("\n\n# Skills\n");
         for s in &skills {
@@ -134,23 +184,15 @@ pub(crate) fn build_agent(cfg: &HashMap<String, Value>) -> Result<Value, String>
         }
     }
 
-    let (mut before, mut after) = (Vec::new(), Vec::new());
-    for h in value_list(cfg.get("hooks")) {
-        if let Value::Hook(hook) = &h {
-            match hook.event {
-                HookEvent::BeforeRun => before.push(h),
-                HookEvent::AfterRun => after.push(h),
-            }
+    // Subagents this agent can delegate to, keyed by name.
+    let mut subagents: Vec<(String, Value)> = Vec::new();
+    for v in value_list(cfg.get("subagents")).into_iter().chain(value_list(cfg.get("agents"))) {
+        match &v {
+            Value::Subagent(s) => subagents.push((s.name.clone(), v.clone())),
+            Value::Agent(a) => subagents.push((a.name.clone(), v.clone())),
+            _ => {}
         }
     }
-
-    let subagents: Vec<(String, Value)> = value_list(cfg.get("agents"))
-        .into_iter()
-        .filter_map(|v| match &v {
-            Value::Agent(a) => Some((a.name.clone(), v.clone())),
-            _ => None,
-        })
-        .collect();
 
     let name = cfg
         .get("name")
@@ -275,29 +317,24 @@ fn b_charter(args: &[Value]) -> Result<Value, String> {
 
 fn b_harness(args: &[Value]) -> Result<Value, String> {
     let h = cfg(args, "harness")?.borrow();
-    let agent = match h.get("agent") {
-        Some(v @ Value::Agent(_)) => Some(v.clone()),
-        Some(other) => return Err(format!("harness 'agent:' must be an agent, got {}", other.type_name())),
-        None => None,
-    };
     let graph = match h.get("graph") {
         Some(v @ Value::Graph(_)) => Some(v.clone()),
-        Some(other) => return Err(format!("harness 'graph:' must be a graph, got {}", other.type_name())),
+        Some(other) => {
+            return Err(format!("harness 'graph:' must be a graph, got {}", other.type_name()))
+        }
         None => None,
     };
     let charter = match h.get("charter") {
         Some(Value::Charter(c)) => Some(c.clone()),
-        Some(other) => return Err(format!("harness 'charter:' must be a charter, got {}", other.type_name())),
+        Some(other) => {
+            return Err(format!("harness 'charter:' must be a charter, got {}", other.type_name()))
+        }
         None => None,
     };
-    if agent.is_none() && graph.is_none() {
-        return Err("harness needs an 'agent:' or a 'graph:'".into());
+    if charter.is_none() && graph.is_none() {
+        return Err("harness needs a 'charter:' or a 'graph:'".into());
     }
-    Ok(Value::Harness(Rc::new(Harness {
-        agent,
-        graph,
-        charter,
-    })))
+    Ok(Value::Harness(Rc::new(Harness { charter, graph })))
 }
 
 fn b_puts(args: &[Value]) -> Result<Value, String> {

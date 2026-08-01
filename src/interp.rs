@@ -384,6 +384,7 @@ impl Interp {
     fn call_method(&mut self, target: Value, name: &str, argv: Vec<Value>) -> Result<Value, String> {
         match target {
             Value::Agent(a) => self.agent_method(&a, name, argv),
+            Value::Subagent(s) => self.subagent_method(&s, name, argv),
             Value::Command(c) => self.command_method(&c, name, argv),
             Value::Graph(g) => self.graph_method(&g, name, argv),
             Value::Factory(fac) => self.factory_method(&fac, name, argv),
@@ -440,7 +441,7 @@ impl Interp {
         args: Vec<Value>,
     ) -> Result<Value, String> {
         match name {
-            "run" | "ask" => {
+            "run" | "ask" | "invoke" => {
                 let input = args.first().map(|v| v.to_string()).unwrap_or_default();
                 self.agent_run(agent, input)
             }
@@ -461,6 +462,10 @@ impl Interp {
                     .ok_or_else(|| format!("agent has no sub-agent '{}'", target))?;
                 match sub {
                     Value::Agent(a) => self.agent_run(&a, task),
+                    Value::Subagent(s) => match &s.agent {
+                        Value::Agent(a) => self.agent_run(a, task),
+                        _ => Err("subagent has no worker agent".into()),
+                    },
                     other => Err(format!("sub-agent '{}' is a {}", target, other.type_name())),
                 }
             }
@@ -507,6 +512,21 @@ impl Interp {
                     .ok_or_else(|| format!("agent has no skill '{}'", wanted))
             }
             None => Err("'use' expects a skill".into()),
+        }
+    }
+
+    fn subagent_method(
+        &mut self,
+        sub: &Rc<crate::value::Subagent>,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, String> {
+        match name {
+            "name" => Ok(Value::Str(sub.name.clone())),
+            "description" => Ok(Value::Str(sub.description.clone())),
+            "agent" => Ok(sub.agent.clone()),
+            // Anything else (run, ask, use, ...) delegates to the worker agent.
+            _ => self.call_method(sub.agent.clone(), name, args),
         }
     }
 
@@ -664,10 +684,6 @@ impl Interp {
             "invoke" | "run" | "trigger" => self.harness_invoke(harness, args),
             "command" => self.charter_lookup(harness, args, true),
             "skill" => self.charter_lookup(harness, args, false),
-            "agent" => harness
-                .agent
-                .clone()
-                .ok_or_else(|| "harness has no agent".to_string()),
             _ => Err(format!("harness has no method '{}'", name)),
         }
     }
@@ -695,13 +711,12 @@ impl Interp {
             }
         }
 
-        // Route through the graph if present, otherwise the agent.
+        // A harness runs its graph; a charter-only harness needs a model,
+        // i.e. it must be combined into an agent to run.
         let mut result = if let Some(Value::Graph(g)) = &harness.graph {
             self.graph_method(g, "invoke", vec![Value::Str(text)])?
-        } else if let Some(Value::Agent(a)) = &harness.agent {
-            self.agent_run(a, text)?
         } else {
-            return Err("harness has nothing to run".into());
+            return Err("harness has no graph to run — add a model to make an agent".into());
         };
 
         if let Some(charter) = &harness.charter {

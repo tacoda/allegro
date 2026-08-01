@@ -19,6 +19,7 @@ pub enum Value {
     // Harness primitives
     Model(Rc<ModelObj>),
     Agent(Rc<AgentObj>),
+    Subagent(Rc<Subagent>),
     Rule(Rc<Rule>),
     Skill(Rc<Skill>),
     Hook(Rc<Hook>),
@@ -42,6 +43,14 @@ pub struct Func {
     pub params: Vec<String>,
     pub body: Vec<Stmt>,
     pub closure: Env,
+}
+
+// A named, specialized delegate (the Claude Code "agent" primitive): a worker
+// agent plus a description of when to use it. A top-level agent delegates to it.
+pub struct Subagent {
+    pub name: String,
+    pub description: String,
+    pub agent: Value, // Value::Agent — the worker that does the work
 }
 
 // A model provider + name. Forward-looking: only "openai" is wired up today.
@@ -128,12 +137,11 @@ pub struct Charter {
     pub commands: Vec<Rc<Command>>,
 }
 
-// The runtime: an agent (or graph) governed by a charter. Invoking it applies
-// the charter's rules and hooks around the run.
+// Intakes a charter (and optionally a graph). A harness plus a model makes an
+// agent; a harness with a graph can be invoked on its own.
 pub struct Harness {
-    pub agent: Option<Value>,     // Value::Agent
-    pub graph: Option<Value>,     // Value::Graph — used instead of the agent if present
     pub charter: Option<Rc<Charter>>,
+    pub graph: Option<Value>, // Value::Graph
 }
 
 // A user-defined subclass of a primitive. `base` is the primitive kind it
@@ -195,6 +203,7 @@ impl Value {
             Value::Hash(_) => "hash",
             Value::Model(_) => "model",
             Value::Agent(_) => "agent",
+            Value::Subagent(_) => "subagent",
             Value::Rule(_) => "rule",
             Value::Skill(_) => "skill",
             Value::Hook(_) => "hook",
@@ -248,6 +257,7 @@ impl fmt::Display for Value {
             }
             Value::Model(m) => write!(f, "#<model {}/{}>", m.provider, m.name),
             Value::Agent(a) => write!(f, "#<agent {} model={}>", a.name, a.core.model),
+            Value::Subagent(s) => write!(f, "#<subagent {}>", s.name),
             Value::Rule(r) => write!(f, "#<rule {}>", r.name),
             Value::Skill(s) => write!(f, "#<skill {}>", s.name),
             Value::Hook(h) => {
