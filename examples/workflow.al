@@ -1,9 +1,9 @@
-# Custom workflows: subclass a primitive, supply a `config`, add methods, keep
-# state in @ivars. Here an agent (= harness + model) delegates to a subagent.
+# A custom workflow defined inline as a class: an Agent (= harness + model)
+# with a subagent to delegate to, a tool the model can call, and memory it
+# keeps across turns. State lives in @ivars.
 
-# A subagent is a named delegate with a description of when to use it
-# (the Claude Code "agent" primitive).
-translator = subagent {
+# A Subagent is a named delegate (the Claude Code "agent" primitive).
+translator = Subagent {
   name: "translator",
   description: "Use to translate text into French",
   model: "gpt-4o-mini",
@@ -11,8 +11,8 @@ translator = subagent {
   temperature: 0.0
 }
 
-# A tool the model can call mid-run to look up a room by department.
-directory = tool {
+# A Tool the model can call mid-run.
+directory = Tool {
   name: "room_for",
   description: "Look up the room number for a department. Input is the department name.",
   run: def (dept)
@@ -27,14 +27,17 @@ directory = tool {
   end
 }
 
-# A front desk: subclass `agent`, wire in the subagent and the tool, add methods.
-class Desk < agent
+# Memory the agent reads and writes across turns.
+notes = Memory { }
+
+class Desk < Agent
   def config
     return {
       model: "gpt-4o-mini",
-      system: "You are a concise front desk. Use the room_for tool for room questions. One sentence.",
+      system: "You are a concise front desk. Use the room_for tool for room questions. Whenever the visitor states a fact, you MUST call the remember tool to save it (do not just acknowledge). Before answering any question about the visitor, you MUST call recall first. One sentence.",
       subagents: [translator],
-      tools: [directory]
+      tools: [directory],
+      memory: notes
     }
   end
 
@@ -57,10 +60,10 @@ class Desk < agent
 end
 
 desk = Desk.new
-puts desk.handle("What is the capital of France?").content
-puts desk.to_french("Good morning, friend.").content
-# the model calls the room_for tool to answer this one
+puts desk.handle("Please remember the VIP guest is named Dr. Lee.").content
 puts desk.handle("Which room is the billing department in?").content
+puts desk.to_french("Good morning, friend.").content
+puts desk.handle("What is the VIP guest's name?").content
 puts "handled: " + str(desk.count)
 
 # Inheritance: specialize the workflow.
@@ -71,4 +74,4 @@ class TerseDesk < Desk
 end
 
 td = TerseDesk.new
-puts td.handle("Describe the weather.").content
+puts td.handle("Describe a good cup of coffee.").content

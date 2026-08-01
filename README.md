@@ -1,10 +1,11 @@
 # allegro
 
-A small Ruby-like language for composing **agents, harnesses, graphs, and factories**.
-Build the definitions with plain constructors, then invoke them.
+A small Ruby-like language for composing **agents, harnesses, graphs, and
+runner queues**. Build the definitions with capitalized constructors, then invoke
+them.
 
 ```ruby
-bot = agent {
+bot = Agent {
   model: env.MODEL || "gpt-4o-mini",
   system: "You are terse."
 }
@@ -19,7 +20,7 @@ environment.
 
 ```bash
 cargo build --release
-OPENAI_API_KEY=sk-... ./target/release/allegro run examples/harness.al
+OPENAI_API_KEY=sk-... ./target/release/allegro run examples/workflow.al
 ```
 
 ## Language
@@ -51,7 +52,7 @@ end
 match reply
 when "yes"        # literal
   puts "affirmative"
-when Number       # type: Nil Bool Number String Array Hash Message Agent Harness ...
+when Number       # type: Nil Bool Number String Array Hash Agent Message ...
   puts "a number"
 when other        # a bare name binds the value
   puts "got: " + str(other)
@@ -60,7 +61,7 @@ end
 
 ### Anonymous functions
 
-`def (params) ... end` is a value — used for hooks, commands, factories, edges:
+`def (params) ... end` is a value — used for hooks, commands, tools, edges:
 
 ```ruby
 double = def (x) return x * 2 end
@@ -69,52 +70,51 @@ puts double(21)   # 42
 
 ## Primitives
 
-Everything is a plain constructor — call it with a config hash, keep the result,
-and invoke it later with a method. Nothing needs a special keyword.
+Primitives are **capitalized constructors** — call one with a config hash, keep the
+result, and invoke it later with a method.
 
-| Primitive | Constructor | Invoke with |
-|-----------|-------------|-------------|
-| `model`    | `model { provider:, name:, temperature: }` | (data — passed to an agent) |
-| `charter`  | `charter { rules:, hooks:, skills:, commands: }` | (definition — intaken by a harness) |
-| `harness`  | `harness { charter:, graph: }` | `.invoke` `.trigger` `.command` `.skill` (graph-backed) |
-| `agent`    | `agent { model:, system:, harness: }` | `.run` `.ask` `.invoke` `.use` `.delegate` `.fan_out` |
-| `subagent` | `subagent { name:, description:, model:, system:, tools: }` | `.run` `.delegate`-target |
-| `tool`     | `tool { name:, description:, run: }` | model calls it during a run; `.run` directly |
-| `rule`     | `rule { name:, text: }` | (data — folded into a charter) |
-| `skill`    | `skill { name:, description:, instructions: }` | `.use` on an agent |
-| `hook`     | `hook { on:, do: }` | (data — folded into a charter/agent) |
-| `command`  | `command { name:, run: }` | `.run` `.call` `.invoke` |
-| `graph`    | `graph { entry:, nodes:, edges: }` | `.invoke` `.trigger` `.run` |
-| `factory`  | `factory { build: }` | `.create` `.build` `.make` |
+| Primitive  | Constructor | Invoke with |
+|------------|-------------|-------------|
+| `Model`    | `Model { provider:, name:, temperature: }` | (data — passed to an agent) |
+| `Charter`  | `Charter { rules:, hooks:, skills:, commands: }` | (definition — intaken by a harness) |
+| `Harness`  | `Harness { charter:, graph: }` | `.invoke` `.trigger` `.command` `.skill` (graph-backed) |
+| `Agent`    | `Agent { model:, system:, harness:, tools:, memory: }` | `.run` `.ask` `.invoke` `.use` `.delegate` `.fan_out` |
+| `Subagent` | `Subagent { name:, description:, model:, system:, tools: }` | `.run` · `.delegate` target |
+| `Tool`     | `Tool { name:, description:, run: }` | model calls it during a run; `.run` directly |
+| `Memory`   | `Memory { }` | `.remember(k,v)` `.recall(k)` `.forget` `.keys` |
+| `Rule`     | `Rule { name:, text: }` | (data — folded into a charter) |
+| `Skill`    | `Skill { name:, description:, instructions: }` | `.use` on an agent |
+| `Hook`     | `Hook { on:, do: }` | (data — folded into a charter/agent) |
+| `Command`  | `Command { name:, run: }` | `.run` `.call` `.invoke` |
+| `Graph`    | `Graph { entry:, nodes:, edges: }` | `.invoke` `.trigger` `.run` |
+| `Factory`  | `Factory { agent:, tasks: }` | `.push` `.run` `.size` |
 
-The composition is **`charter → harness → agent`**: a charter bundles governance,
+The composition is **`Charter → Harness → Agent`**: a charter bundles governance,
 a harness intakes a charter (and may carry a graph), and an **agent is a harness
-plus a model**. Agents delegate to **subagents** — named, described worker agents
-(the Claude Code "agent" primitive).
+plus a model**. Agents delegate to **subagents** (the Claude Code "agent"
+primitive), call **tools**, and read/write **memory**.
 
-### model
+### Model
 
 Names a provider + model. Only `openai` is implemented today; the primitive
 exists so other providers can be added without touching agent code. An agent's
 `model:` accepts a model primitive or a bare string (openai shorthand).
 
 ```ruby
-fast = model { provider: "openai", name: "gpt-4o-mini", temperature: 0.2 }
-bot  = agent { model: fast, system: "..." }
+fast = Model { provider: "openai", name: "gpt-4o-mini", temperature: 0.2 }
+bot  = Agent { model: fast, system: "..." }
 ```
 
-### agent (= harness + model)
-
-An agent combines a model with a harness (its governance) and can delegate to
-subagents.
+### Agent (= harness + model)
 
 ```ruby
-bot = agent {
+bot = Agent {
   name: "bot",
-  model: fast,              # a model primitive or a string
+  model: "gpt-4o-mini",
   system: "You are helpful.",
-  temperature: 0.2,
   harness: gov,             # governance: rules/hooks/skills from its charter
+  tools: [calculator],      # callables the model may invoke
+  memory: notes,            # persistent store (remember/recall)
   subagents: [translator]   # delegates, reachable via .delegate
 }
 
@@ -124,95 +124,80 @@ bot.delegate("translator", "...")   # hand off to a named subagent
 bot.fan_out(["a", "b"])             # run over many inputs concurrently -> [Message]
 ```
 
-Rules, hooks, and skills can also be passed inline (`rules:`, `hooks:`, `skills:`)
-instead of through a harness — they end up in the same place.
+Rules, hooks, and skills may also be passed inline (`rules:`, `hooks:`, `skills:`).
 
-### subagent
+### Subagent
 
 A named, described worker an agent delegates to.
 
 ```ruby
-translator = subagent {
+translator = Subagent {
   name: "translator",
   description: "Use to translate text into French",
   model: "gpt-4o-mini",
   system: "Translate to French. Output only the translation.",
-  tools: [dictionary]        # subagents (and agents) can carry tools
+  tools: [dictionary]
 }
 ```
 
-### tool
+### Tool
 
-A callable the model may invoke mid-run via OpenAI function calling. `run:` is a
-function taking the tool's string input. Attach with `tools:` on an agent or
-subagent; the run loops until the model produces a final answer.
+A callable the model may invoke mid-run via OpenAI function calling. `run:` takes
+the tool's string input. Attach with `tools:` on an agent or subagent; the run
+loops until the model produces a final answer.
 
 ```ruby
-shout = tool {
+shout = Tool {
   name: "shout",
   description: "Convert text to UPPERCASE. Use when asked to shout.",
   run: def (text) return text.upcase end
 }
 
-crier = agent { model: "gpt-4o-mini", system: "Call shout when asked.", tools: [shout] }
-crier.run("Please shout: hello")   # model calls shout, result fed back -> HELLO
-shout.run("direct")                # tools are also callable directly -> DIRECT
+crier = Agent { model: "gpt-4o-mini", tools: [shout] }
+crier.run("Please shout: hello")   # model calls shout -> HELLO
+shout.run("direct")                # tools are callable directly -> DIRECT
 ```
 
-### rule / skill / hook / command
+### Memory
+
+A persistent key/value store. Attach with `memory:` and the model gets built-in
+`remember` and `recall` tools; `recall` fuzzily matches when a later turn phrases
+a key differently.
 
 ```ruby
-concise   = rule  { name: "concise", text: "Answer in one sentence." }
-summarize = skill { name: "summarize", description: "Condense", instructions: "Summarize:" }
-
-redact = hook {
-  on: "before_run",              # or "after_run"
-  do: def (input)
-    if input.contains?("password")
-      return halt("(redacted)")  # halt short-circuits the run
-    end
-    return input
-  end
-}
-
-brief = command { name: "brief", run: def (topic) return "brief: " + topic end }
-brief.run("the ocean")
+notes = Memory { }
+bot = Agent { model: "gpt-4o-mini", memory: notes, system: "Remember facts; recall before answering." }
+bot.run("My favorite color is teal.")
+bot.run("What is my favorite color?")   # -> teal
+notes.recall("favorite_color")          # read it directly
 ```
 
-### charter + harness
+### Charter + Harness
 
-A **charter** is a pure bundle of rules, hooks, skills, and commands. A **harness**
-intakes a charter (and may carry a graph). Give a harness a model and you have an
-agent; give it a graph and it runs on its own.
+A **Charter** bundles rules, hooks, skills, and commands. A **Harness** intakes a
+charter (and may carry a graph). A harness + a model is an agent; a harness with a
+graph runs on its own.
 
 ```ruby
-governance = charter {
-  rules:    [concise],
-  hooks:    [redact],
-  skills:   [summarize],
-  commands: [brief]
-}
+governance = Charter { rules: [concise], hooks: [redact], commands: [brief] }
+gov = Harness { charter: governance }
+gov.command("brief").run("the sea")            # reach into the charter
 
-gov = harness { charter: governance }
-gov.command("brief").run("the sea")   # reach into the charter
+assistant = Agent { model: "gpt-4o-mini", harness: gov }
+assistant.invoke("What is Rust good at?")      # rules + hooks applied
 
-# a harness + a model = an agent
-assistant = agent { model: "gpt-4o-mini", harness: gov }
-assistant.invoke("What is Rust good at?")   # rules + hooks applied
-
-# a harness with a graph is invocable on its own
-router = harness { graph: flow }
-router.trigger("some input")
+router = Harness { graph: flow }
+router.trigger("some input")                   # graph-backed harness
 ```
 
-### graph
+### Graph
 
-Nodes are agents, functions, or **subgraphs**. Each node's output becomes the next
-node's input. An edge is either a target node name or a router **function** that
+Control-flow routing. Nodes are agents, functions, or subgraphs; each node's
+output feeds the next. An edge is a target node name or a router function that
 returns the next name; `"end"` (or `nil`) stops.
 
 ```ruby
-flow = graph {
+flow = Graph {
   entry: "classify",
   nodes: { classify: classifier, answer: responder },
   edges: {
@@ -223,28 +208,32 @@ flow = graph {
 flow.trigger("What is 2+2?")
 ```
 
-### factory
+### Factory (agent runner queue)
+
+A worker agent plus a FIFO queue of tasks. Push tasks and drain them through the
+worker, one result per task.
 
 ```ruby
-persona = factory {
-  build: def (voice)
-    return agent { name: voice, model: "gpt-4o-mini", system: "Speak like a " + voice + "." }
-  end
-}
-pirate = persona.create("pirate")
+runner = Factory { agent: worker, tasks: ["a", "b"] }
+runner.push("c")
+runner.size            # 3
+for r in runner.run    # drains the queue -> [Message]
+  puts r.content
+end
+runner.run(["d", "e"]) # enqueue inline, then drain
 ```
 
 ## Custom workflows: classes & inheritance
 
-Subclass any primitive to define your own reusable workflow. A class supplies a
+Subclass any primitive to define a reusable workflow inline. A class supplies a
 `config` (the base primitive's construction hash), adds methods, keeps state in
 `@ivars`, and may override or extend inherited behavior. `Name.new` builds it;
 `self.base` reaches the underlying primitive; undefined methods delegate to it.
 
 ```ruby
-class Desk < agent
+class Desk < Agent
   def config
-    return { model: "gpt-4o-mini", system: "...", subagents: [translator] }
+    return { model: "gpt-4o-mini", system: "...", subagents: [translator], memory: notes }
   end
 
   def init            # runs on .new
@@ -293,6 +282,6 @@ Primitives produce structured values, not bare strings:
 
 ## Examples
 
-- `examples/agents.al` — fan-out + pipeline
-- `examples/harness.al` — charter + harness, hooks, graph, pattern matching
-- `examples/workflow.al` — custom workflows via classes and inheritance
+- `examples/agents.al` — a worker class run through a Factory queue + fan-out
+- `examples/harness.al` — Charter → Harness → Agent, hooks, graph, pattern matching
+- `examples/workflow.al` — a Desk agent with a subagent, a tool, memory, and inheritance

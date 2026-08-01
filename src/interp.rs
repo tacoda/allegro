@@ -413,7 +413,7 @@ impl Interp {
             text = val.to_string();
         }
 
-        let content = if agent.tools.is_empty() {
+        let content = if agent.tools.is_empty() && agent.memory.is_none() {
             agent.core.run(&text)?
         } else {
             self.run_with_tools(agent, &text)?
@@ -446,7 +446,10 @@ impl Interp {
     // Run an agent that has tools: loop chat completions, executing any tool
     // calls the model requests and feeding results back until it answers.
     fn run_with_tools(&mut self, agent: &Rc<AgentObj>, input: &str) -> Result<String, String> {
-        let specs = tool_specs(&agent.tools);
+        let mut specs = tool_specs(&agent.tools);
+        if agent.memory.is_some() {
+            specs.extend(memory_tool_specs());
+        }
         let mut messages: Vec<serde_json::Value> = Vec::new();
         let sys = agent.core.system();
         if !sys.is_empty() {
@@ -490,16 +493,52 @@ impl Interp {
     }
 
     fn invoke_tool(&mut self, agent: &Rc<AgentObj>, call: &ToolCall) -> Result<String, String> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
+
+        // Built-in memory tools take precedence over user tools.
+        if let Some(mem) = &agent.memory {
+            let field = |k: &str| parsed.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            match call.name.as_str() {
+                "remember" => {
+                    mem.store.borrow_mut().insert(field("key"), field("value"));
+                    return Ok(format!("remembered '{}'", field("key")));
+                }
+                "recall" => {
+                    let key = field("key");
+                    let store = mem.store.borrow();
+                    if let Some(v) = store.get(&key) {
+                        return Ok(v.clone());
+                    }
+                    // No exact hit — fuzzily match the query against keys and
+                    // values, since a later turn may phrase the key differently.
+                    let q = key.to_lowercase();
+                    let hits: Vec<String> = store
+                        .iter()
+                        .filter(|(k, v)| {
+                            let (kl, vl) = (k.to_lowercase(), v.to_lowercase());
+                            kl.contains(&q) || q.contains(&kl) || vl.contains(&q)
+                        })
+                        .map(|(k, v)| format!("{}: {}", k, v))
+                        .collect();
+                    return Ok(if hits.is_empty() {
+                        format!("nothing remembered for '{}'", key)
+                    } else {
+                        hits.join("; ")
+                    });
+                }
+                _ => {}
+            }
+        }
+
         let tool = agent
             .tools
             .iter()
             .find(|t| t.name == call.name)
             .cloned()
             .ok_or_else(|| format!("model called unknown tool '{}'", call.name))?;
-        // Tools take a single `input` string argument.
-        let args: serde_json::Value =
-            serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
-        let input = args
+        // User tools take a single `input` string argument.
+        let input = parsed
             .get("input")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
@@ -572,6 +611,11 @@ impl Interp {
                     .collect();
                 Ok(Value::Array(Rc::new(RefCell::new(msgs))))
             }
+            "memory" => agent
+                .memory
+                .clone()
+                .map(Value::Memory)
+                .ok_or_else(|| "agent has no memory".to_string()),
             "name" => Ok(Value::Str(agent.name.clone())),
             "model" => Ok(Value::Str(agent.core.model.clone())),
             "skills" => {
@@ -642,8 +686,45 @@ impl Interp {
         args: Vec<Value>,
     ) -> Result<Value, String> {
         match name {
-            "create" | "build" | "make" => self.apply(fac.build.clone(), args),
+            "push" | "enqueue" | "add" => {
+                for a in args {
+                    enqueue(fac, a);
+                }
+                Ok(Value::Num(fac.queue.borrow().len() as f64))
+            }
+            "size" | "length" | "pending" => Ok(Value::Num(fac.queue.borrow().len() as f64)),
+            // Enqueue any args, then drain the whole queue through the worker.
+            "run" | "process" | "drain" | "invoke" => {
+                for a in args {
+                    enqueue(fac, a);
+                }
+                let mut results = Vec::new();
+                loop {
+                    let task = fac.queue.borrow_mut().pop_front();
+                    match task {
+                        Some(t) => results.push(self.run_worker(&fac.agent, t)?),
+                        None => break,
+                    }
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(results))))
+            }
             _ => Err(format!("factory has no method '{}'", name)),
+        }
+    }
+
+    // Run a factory's worker (an agent, subagent, or class instance) on one task.
+    fn run_worker(&mut self, worker: &Value, task: String) -> Result<Value, String> {
+        match worker {
+            Value::Agent(a) => self.agent_run(a, task),
+            Value::Subagent(s) => match &s.agent {
+                Value::Agent(a) => self.agent_run(a, task),
+                _ => Err("subagent has no worker agent".into()),
+            },
+            Value::Instance(i) => {
+                let base = i.base.clone();
+                self.run_worker(&base, task)
+            }
+            other => Err(format!("factory worker is a {}", other.type_name())),
         }
     }
 
@@ -932,6 +1013,51 @@ fn tool_specs(tools: &[Rc<Tool>]) -> Vec<serde_json::Value> {
             })
         })
         .collect()
+}
+
+// Built-in tool specs an agent with memory exposes to the model.
+fn memory_tool_specs() -> Vec<serde_json::Value> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "remember",
+                "description": "Save a fact to memory for later. Provide a short key and its value.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string", "description": "short identifier" },
+                        "value": { "type": "string", "description": "the fact to store" }
+                    },
+                    "required": ["key", "value"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "recall",
+                "description": "Look up a previously remembered fact by its key.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "key": { "type": "string", "description": "the key to look up" } },
+                    "required": ["key"]
+                }
+            }
+        }),
+    ]
+}
+
+// Enqueue a task or, if given an array, each of its items.
+fn enqueue(fac: &Rc<Factory>, v: Value) {
+    match v {
+        Value::Array(a) => {
+            for item in a.borrow().iter() {
+                fac.queue.borrow_mut().push_back(item.to_string());
+            }
+        }
+        other => fac.queue.borrow_mut().push_back(other.to_string()),
+    }
 }
 
 fn make_message(content: String, from: &str) -> Value {

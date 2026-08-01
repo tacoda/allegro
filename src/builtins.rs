@@ -5,7 +5,7 @@ use std::rc::Rc;
 use crate::openai::Agent;
 use crate::value::{
     AgentObj, Charter, Command, Env, Factory, Graph, Harness, Hook, HookEvent, HookResult, Message,
-    ModelObj, Rule, Skill, Subagent, Tool, Value,
+    Memory, ModelObj, Rule, Skill, Subagent, Tool, Value,
 };
 
 pub fn register(env: &Env) {
@@ -25,19 +25,20 @@ pub fn register(env: &Env) {
     e.define("halt", Value::Builtin("halt", b_halt));
     e.define("keep", Value::Builtin("keep", b_keep));
     e.define("message", Value::Builtin("message", b_message));
-    // primitive constructors — built up as definitions, then invoked
-    e.define("model", Value::Builtin("model", b_model));
-    e.define("agent", Value::Builtin("agent", b_agent));
-    e.define("subagent", Value::Builtin("subagent", b_subagent));
-    e.define("tool", Value::Builtin("tool", b_tool));
-    e.define("rule", Value::Builtin("rule", b_rule));
-    e.define("skill", Value::Builtin("skill", b_skill));
-    e.define("hook", Value::Builtin("hook", b_hook));
-    e.define("command", Value::Builtin("command", b_command));
-    e.define("graph", Value::Builtin("graph", b_graph));
-    e.define("factory", Value::Builtin("factory", b_factory));
-    e.define("charter", Value::Builtin("charter", b_charter));
-    e.define("harness", Value::Builtin("harness", b_harness));
+    // primitive constructors — capitalized because we are constructing them
+    e.define("Model", Value::Builtin("Model", b_model));
+    e.define("Agent", Value::Builtin("Agent", b_agent));
+    e.define("Subagent", Value::Builtin("Subagent", b_subagent));
+    e.define("Tool", Value::Builtin("Tool", b_tool));
+    e.define("Memory", Value::Builtin("Memory", b_memory));
+    e.define("Rule", Value::Builtin("Rule", b_rule));
+    e.define("Skill", Value::Builtin("Skill", b_skill));
+    e.define("Hook", Value::Builtin("Hook", b_hook));
+    e.define("Command", Value::Builtin("Command", b_command));
+    e.define("Graph", Value::Builtin("Graph", b_graph));
+    e.define("Factory", Value::Builtin("Factory", b_factory));
+    e.define("Charter", Value::Builtin("Charter", b_charter));
+    e.define("Harness", Value::Builtin("Harness", b_harness));
 }
 
 // Build a non-agent primitive by kind from a config hash. Used by subclass
@@ -45,18 +46,19 @@ pub fn register(env: &Env) {
 pub(crate) fn make(kind: &str, cfg: Value) -> Result<Value, String> {
     let args = [cfg];
     match kind {
-        "model" => b_model(&args),
-        "agent" => b_agent(&args),
-        "subagent" => b_subagent(&args),
-        "tool" => b_tool(&args),
-        "rule" => b_rule(&args),
-        "skill" => b_skill(&args),
-        "hook" => b_hook(&args),
-        "command" => b_command(&args),
-        "graph" => b_graph(&args),
-        "factory" => b_factory(&args),
-        "charter" => b_charter(&args),
-        "harness" => b_harness(&args),
+        "Model" => b_model(&args),
+        "Agent" => b_agent(&args),
+        "Subagent" => b_subagent(&args),
+        "Tool" => b_tool(&args),
+        "Memory" => b_memory(&args),
+        "Rule" => b_rule(&args),
+        "Skill" => b_skill(&args),
+        "Hook" => b_hook(&args),
+        "Command" => b_command(&args),
+        "Graph" => b_graph(&args),
+        "Factory" => b_factory(&args),
+        "Charter" => b_charter(&args),
+        "Harness" => b_harness(&args),
         other => Err(format!("cannot subclass '{}'", other)),
     }
 }
@@ -191,6 +193,11 @@ pub(crate) fn build_agent(cfg: &HashMap<String, Value>) -> Result<Value, String>
         .filter_map(|v| if let Value::Tool(t) = v { Some(t) } else { None })
         .collect();
 
+    let memory = match cfg.get("memory") {
+        Some(Value::Memory(m)) => Some(m.clone()),
+        _ => None,
+    };
+
     // Subagents this agent can delegate to, keyed by name.
     let mut subagents: Vec<(String, Value)> = Vec::new();
     for v in value_list(cfg.get("subagents")).into_iter().chain(value_list(cfg.get("agents"))) {
@@ -214,6 +221,7 @@ pub(crate) fn build_agent(cfg: &HashMap<String, Value>) -> Result<Value, String>
         after,
         skills,
         tools,
+        memory,
         subagents,
     })))
 }
@@ -229,6 +237,23 @@ fn b_tool(args: &[Value]) -> Result<Value, String> {
         name: get_str(&h, "name", "tool"),
         description: get_str(&h, "description", ""),
         action,
+    })))
+}
+
+fn b_memory(args: &[Value]) -> Result<Value, String> {
+    // Optional `store:` hash seeds the memory with initial entries.
+    let mut store = HashMap::new();
+    if let Some(h) = args.first() {
+        if let Value::Hash(m) = h {
+            if let Some(Value::Hash(seed)) = m.borrow().get("store") {
+                for (k, v) in seed.borrow().iter() {
+                    store.insert(k.clone(), v.to_string());
+                }
+            }
+        }
+    }
+    Ok(Value::Memory(Rc::new(Memory {
+        store: std::cell::RefCell::new(store),
     })))
 }
 
@@ -293,8 +318,22 @@ fn b_graph(args: &[Value]) -> Result<Value, String> {
 
 fn b_factory(args: &[Value]) -> Result<Value, String> {
     let h = cfg(args, "factory")?.borrow();
-    let build = h.get("build").cloned().ok_or("factory needs a 'build:' function")?;
-    Ok(Value::Factory(Rc::new(Factory { build })))
+    let agent = match h.get("agent") {
+        Some(v @ (Value::Agent(_) | Value::Subagent(_) | Value::Instance(_))) => v.clone(),
+        Some(other) => {
+            return Err(format!("factory 'agent:' must be an agent, got {}", other.type_name()))
+        }
+        None => return Err("factory needs a worker 'agent:'".into()),
+    };
+    // Optional initial tasks to seed the queue.
+    let queue: std::collections::VecDeque<String> = value_list(h.get("tasks"))
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
+    Ok(Value::Factory(Rc::new(Factory {
+        agent,
+        queue: std::cell::RefCell::new(queue),
+    })))
 }
 
 fn value_list(v: Option<&Value>) -> Vec<Value> {
@@ -451,7 +490,11 @@ fn b_range(args: &[Value]) -> Result<Value, String> {
 // fan_out(agent, [inputs]) -> [messages] — runs the agent on each input concurrently.
 fn b_fan_out(args: &[Value]) -> Result<Value, String> {
     let agent = match args.first() {
-        Some(Value::Agent(a)) => a,
+        Some(Value::Agent(a)) => a.clone(),
+        Some(Value::Instance(i)) => match &i.base {
+            Value::Agent(a) => a.clone(),
+            _ => return Err("fan_out instance has no worker agent".into()),
+        },
         _ => return Err("fan_out expects an agent as its first argument".into()),
     };
     let inputs: Vec<String> = match args.get(1) {

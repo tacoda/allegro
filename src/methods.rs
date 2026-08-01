@@ -12,6 +12,7 @@ pub fn dispatch(recv: Value, name: &str, args: Vec<Value>) -> Result<Value, Stri
         Value::Array(a) => array_method(a, name, &args),
         Value::Hash(h) => hash_method(h, name, &args),
         Value::Num(n) => number_method(*n, name),
+        Value::Memory(m) => memory_method(m, name, &args),
         Value::Message(m) => message_method(m, name),
         Value::HookResult(r) => hook_result_method(r, name),
         Value::Model(m) => match name {
@@ -146,6 +147,38 @@ fn number_method(n: f64, name: &str) -> Result<Value, String> {
         "floor" => Ok(Value::Num(n.floor())),
         "ceil" => Ok(Value::Num(n.ceil())),
         _ => Err(format!("number has no method '{}'", name)),
+    }
+}
+
+fn memory_method(
+    m: &Rc<crate::value::Memory>,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, String> {
+    match name {
+        "remember" | "set" => {
+            let key = arg0(args, name)?.to_string();
+            let val = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            m.store.borrow_mut().insert(key, val.clone());
+            Ok(Value::Str(val))
+        }
+        "recall" | "get" => {
+            let key = arg0(args, name)?.to_string();
+            Ok(m.store.borrow().get(&key).cloned().map(Value::Str).unwrap_or(Value::Nil))
+        }
+        "forget" => {
+            let key = arg0(args, "forget")?.to_string();
+            Ok(Value::Bool(m.store.borrow_mut().remove(&key).is_some()))
+        }
+        "has?" => {
+            let key = arg0(args, "has?")?.to_string();
+            Ok(Value::Bool(m.store.borrow().contains_key(&key)))
+        }
+        "keys" => Ok(list(
+            m.store.borrow().keys().map(|k| Value::Str(k.clone())),
+        )),
+        "size" | "length" => Ok(Value::Num(m.store.borrow().len() as f64)),
+        _ => Err(format!("memory has no method '{}'", name)),
     }
 }
 

@@ -1,29 +1,30 @@
-# Fan-out and pipeline over real agents.
+# Define a worker agent inline as a class, then run a queue of tasks through a
+# Factory (an agent runner queue).
 # Run: OPENAI_API_KEY=... allegro run examples/agents.al
 
-researcher = agent {
-  name: "researcher",
-  model: "gpt-4o-mini",
-  system: "Give one interesting fact. One sentence.",
-  temperature: 0.3
-}
-
-writer = agent {
-  name: "writer",
-  model: "gpt-4o-mini",
-  system: "Rewrite the input as a single punchy tweet.",
-  temperature: 0.7
-}
-
-# fan_out runs the researcher on every topic concurrently.
-topics = ["octopuses", "the moon", "coffee"]
-facts = fan_out(researcher, topics)
-
-for f in facts
-  puts "- " + f.content
+class Researcher < Agent
+  def config
+    return {
+      model: "gpt-4o-mini",
+      system: "Give one interesting fact about the topic. One sentence.",
+      temperature: 0.3
+    }
+  end
 end
 
-# pipeline feeds one agent's output into the next.
-tweet = pipeline("black holes", researcher, writer)
-puts ""
-puts "tweet: " + tweet
+# A Factory queues tasks and drains them through the worker, one result each.
+runner = Factory {
+  agent: Researcher.new,
+  tasks: ["octopuses", "the moon"]
+}
+runner.push("coffee")
+
+for fact in runner.run
+  puts "- " + fact.content
+end
+
+# fan_out runs a worker over inputs concurrently.
+tweets = fan_out(Researcher.new, ["black holes", "the deep sea"])
+for t in tweets
+  puts "* " + t.content
+end

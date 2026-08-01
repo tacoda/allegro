@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 
@@ -21,6 +21,7 @@ pub enum Value {
     Agent(Rc<AgentObj>),
     Subagent(Rc<Subagent>),
     Tool(Rc<Tool>),
+    Memory(Rc<Memory>),
     Rule(Rc<Rule>),
     Skill(Rc<Skill>),
     Hook(Rc<Hook>),
@@ -69,6 +70,12 @@ pub struct Tool {
     pub action: Value,
 }
 
+// A persistent key/value store an agent can read and write. When attached to
+// an agent, the model gets built-in `remember` and `recall` tools.
+pub struct Memory {
+    pub store: RefCell<HashMap<String, String>>,
+}
+
 // A configured agent: an LLM core plus the harness machinery wrapped around it.
 pub struct AgentObj {
     pub name: String,
@@ -77,6 +84,7 @@ pub struct AgentObj {
     pub after: Vec<Value>,           // hook functions run on output
     pub skills: Vec<Rc<Skill>>,      // named capabilities
     pub tools: Vec<Rc<Tool>>,        // callables the model may invoke
+    pub memory: Option<Rc<Memory>>,  // persistent store, exposed as remember/recall
     pub subagents: Vec<(String, Value)>, // delegates, keyed by name
 }
 
@@ -131,10 +139,11 @@ impl Graph {
     }
 }
 
-// Produces configured primitives on demand from a spec. `build` is a function
-// spec -> value (usually an agent), so one definition can stamp out many.
+// An agent runner queue: a worker agent plus a FIFO queue of inputs. Push
+// tasks and drain them through the agent, collecting one result per task.
 pub struct Factory {
-    pub build: Value,
+    pub agent: Value, // Value::Agent or Value::Subagent — the worker
+    pub queue: RefCell<VecDeque<String>>,
 }
 
 // A pure definition: the rules, hooks, skills, and commands that govern an
@@ -215,6 +224,7 @@ impl Value {
             Value::Agent(_) => "agent",
             Value::Subagent(_) => "subagent",
             Value::Tool(_) => "tool",
+            Value::Memory(_) => "memory",
             Value::Rule(_) => "rule",
             Value::Skill(_) => "skill",
             Value::Hook(_) => "hook",
@@ -270,6 +280,7 @@ impl fmt::Display for Value {
             Value::Agent(a) => write!(f, "#<agent {} model={}>", a.name, a.core.model),
             Value::Subagent(s) => write!(f, "#<subagent {}>", s.name),
             Value::Tool(t) => write!(f, "#<tool {}>", t.name),
+            Value::Memory(m) => write!(f, "#<memory {} entries>", m.store.borrow().len()),
             Value::Rule(r) => write!(f, "#<rule {}>", r.name),
             Value::Skill(s) => write!(f, "#<skill {}>", s.name),
             Value::Hook(h) => {
@@ -281,7 +292,7 @@ impl fmt::Display for Value {
             }
             Value::Command(c) => write!(f, "#<command {}>", c.name),
             Value::Graph(g) => write!(f, "#<graph entry={}>", g.entry),
-            Value::Factory(_) => write!(f, "#<factory>"),
+            Value::Factory(fac) => write!(f, "#<factory queued={}>", fac.queue.borrow().len()),
             Value::Charter(c) => write!(
                 f,
                 "#<charter rules={} hooks={} skills={} commands={}>",
