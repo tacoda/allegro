@@ -11,13 +11,30 @@ translator = subagent {
   temperature: 0.0
 }
 
-# A front desk: subclass `agent`, wire in the subagent, add domain methods.
+# A tool the model can call mid-run to look up a room by department.
+directory = tool {
+  name: "room_for",
+  description: "Look up the room number for a department. Input is the department name.",
+  run: def (dept)
+    d = dept.downcase
+    if d.contains?("billing")
+      return "Room 204"
+    elsif d.contains?("support")
+      return "Room 118"
+    else
+      return "unknown department"
+    end
+  end
+}
+
+# A front desk: subclass `agent`, wire in the subagent and the tool, add methods.
 class Desk < agent
   def config
     return {
       model: "gpt-4o-mini",
-      system: "You are a concise front desk. One sentence.",
-      subagents: [translator]
+      system: "You are a concise front desk. Use the room_for tool for room questions. One sentence.",
+      subagents: [translator],
+      tools: [directory]
     }
   end
 
@@ -42,6 +59,8 @@ end
 desk = Desk.new
 puts desk.handle("What is the capital of France?").content
 puts desk.to_french("Good morning, friend.").content
+# the model calls the room_for tool to answer this one
+puts desk.handle("Which room is the billing department in?").content
 puts "handled: " + str(desk.count)
 
 # Inheritance: specialize the workflow.
