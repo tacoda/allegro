@@ -74,16 +74,7 @@ impl Value {
                 let inner: Vec<String> = items.iter().map(|v| v.inspect()).collect();
                 format!("{{{}}}", inner.join(", "))
             }
-            Value::Map(pairs) => {
-                let inner: Vec<String> = pairs
-                    .iter()
-                    .map(|(k, v)| match k {
-                        Value::Atom(a) => format!("{}: {}", a, v.inspect()),
-                        other => format!("{} => {}", other.inspect(), v.inspect()),
-                    })
-                    .collect();
-                format!("%{{{}}}", inner.join(", "))
-            }
+            Value::Map(pairs) => inspect_map(pairs),
             other => other.to_string(),
         }
     }
@@ -102,6 +93,27 @@ impl fmt::Display for Value {
             Value::List(_) | Value::Tuple(_) | Value::Map(_) => write!(f, "{}", self.inspect()),
             Value::Fun(_) => write!(f, "#Function"),
         }
+    }
+}
+
+// A struct (a map tagged with `:__struct__`) renders as `%Name{...}`; a plain
+// map as `%{...}`.
+fn inspect_map(pairs: &[(Value, Value)]) -> String {
+    let struct_name = pairs.iter().find_map(|(k, v)| match (k, v) {
+        (Value::Atom(a), Value::Atom(name)) if a == "__struct__" => Some(name.clone()),
+        _ => None,
+    });
+    let inner: Vec<String> = pairs
+        .iter()
+        .filter(|(k, _)| !matches!(k, Value::Atom(a) if a == "__struct__"))
+        .map(|(k, v)| match k {
+            Value::Atom(a) => format!("{}: {}", a, v.inspect()),
+            other => format!("{} => {}", other.inspect(), v.inspect()),
+        })
+        .collect();
+    match struct_name {
+        Some(name) => format!("%{}{{{}}}", name, inner.join(", ")),
+        None => format!("%{{{}}}", inner.join(", ")),
     }
 }
 

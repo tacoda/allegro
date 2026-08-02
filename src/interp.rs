@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::ast::{BinOp, CaseClause, Def, Expr, Pattern, StrPart, TopItem, UnOp};
+use crate::ast::{BinOp, CaseClause, Def, Expr, Pattern, StrPart, StructFields, TopItem, UnOp};
 use crate::parser::expr_to_pattern;
 use crate::value::{new_env, values_equal, Env, Fun, Value};
 
 pub struct Interp {
-    // module name -> (function name, arity) -> clauses (tried in order)
-    modules: HashMap<String, HashMap<(String, usize), Vec<Rc<Def>>>>,
+    // module name -> function name -> clauses (tried in order; arity handled per-clause)
+    modules: HashMap<String, HashMap<String, Vec<Rc<Def>>>>,
+    // module name -> its declared struct fields (from `defstruct`)
+    structs: HashMap<String, StructFields>,
     global: Env,
     // stack of the module whose body is executing, for local-call resolution
     current: Vec<String>,
@@ -17,6 +19,7 @@ impl Interp {
     pub fn new() -> Interp {
         Interp {
             modules: HashMap::new(),
+            structs: HashMap::new(),
             global: new_env(None),
             current: Vec::new(),
         }
@@ -24,8 +27,13 @@ impl Interp {
 
     pub fn run(&mut self, program: &[TopItem]) -> Result<(), String> {
         for item in program {
-            if let TopItem::Module { name, defs } = item {
-                self.register(name, defs);
+            if let TopItem::Module {
+                name,
+                defs,
+                struct_fields,
+            } = item
+            {
+                self.register(name, defs, struct_fields);
             }
         }
         for item in program {
@@ -37,13 +45,13 @@ impl Interp {
         Ok(())
     }
 
-    fn register(&mut self, name: &str, defs: &[Def]) {
+    fn register(&mut self, name: &str, defs: &[Def], struct_fields: &Option<StructFields>) {
         let table = self.modules.entry(name.to_string()).or_default();
         for def in defs {
-            table
-                .entry((def.name.clone(), def.params.len()))
-                .or_default()
-                .push(Rc::new(def.clone()));
+            table.entry(def.name.clone()).or_default().push(Rc::new(def.clone()));
+        }
+        if let Some(fields) = struct_fields {
+            self.structs.insert(name.to_string(), fields.clone());
         }
     }
 
@@ -71,6 +79,7 @@ impl Interp {
             Expr::Cons(h, t) => self.eval_cons(h, t, env),
             Expr::Tuple(items) => Ok(Value::tuple(self.eval_args(items, env)?)),
             Expr::Map(pairs) => self.eval_map(pairs, env),
+            Expr::Struct(name, fields) => self.eval_struct(name, fields, env),
             Expr::Block(stmts) => self.eval_block(stmts, env),
             Expr::Match(lhs, rhs) => self.eval_match(lhs, rhs, env),
             Expr::Binary(op, l, r) => self.eval_binary(*op, l, r, env),
@@ -237,6 +246,41 @@ impl Interp {
         Ok(Value::Map(Rc::new(out)))
     }
 
+    fn eval_struct(
+        &mut self,
+        name: &str,
+        fields: &[(String, Expr)],
+        env: &Env,
+    ) -> Result<Value, String> {
+        let def = self
+            .structs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("{} is not a struct", name))?;
+        let mut out: Vec<(Value, Value)> =
+            vec![(Value::Atom("__struct__".into()), Value::Atom(name.to_string()))];
+        for (fname, default) in &def {
+            let v = match default {
+                Some(e) => self.eval(e, env)?,
+                None => Value::Nil,
+            };
+            out.push((Value::Atom(fname.clone()), v));
+        }
+        for (fname, expr) in fields {
+            if !def.iter().any(|(f, _)| f == fname) {
+                return Err(format!("unknown field :{} for %{}{{}}", fname, name));
+            }
+            let v = self.eval(expr, env)?;
+            if let Some(slot) = out
+                .iter_mut()
+                .find(|(k, _)| matches!(k, Value::Atom(a) if a == fname))
+            {
+                slot.1 = v;
+            }
+        }
+        Ok(Value::Map(Rc::new(out)))
+    }
+
     fn eval_match(&mut self, lhs: &Expr, rhs: &Expr, env: &Env) -> Result<Value, String> {
         let val = self.eval(rhs, env)?;
         let pat = expr_to_pattern(lhs.clone())?;
@@ -311,55 +355,74 @@ impl Interp {
     // ---- calls ----
 
     fn local_call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
-        let arity = args.len();
         if let Some(module) = self.current.last().cloned() {
-            if self.has_def(&module, name, arity) {
+            if self.has_def(&module, name) {
                 return self.call_user(&module, name, args);
             }
         }
         if is_kernel(name) {
             return kernel_call(name, args);
         }
-        Err(format!("undefined function {}/{}", name, arity))
+        Err(format!("undefined function {}/{}", name, args.len()))
     }
 
     fn remote_call(&mut self, module: &str, fun: &str, args: Vec<Value>) -> Result<Value, String> {
         match module {
             "IO" => io_call(fun, args),
             "Kernel" => kernel_call(fun, args),
+            "Enum" => self.enum_call(fun, args),
+            "String" => string_call(fun, args),
+            "Map" => map_call(fun, args),
+            "List" => list_call(fun, args),
+            "Integer" => integer_call(fun, args),
             _ if self.modules.contains_key(module) => {
-                if self.has_def(module, fun, args.len()) {
+                if self.has_def(module, fun) {
                     self.call_user(module, fun, args)
                 } else {
-                    Err(format!(
-                        "function {}.{}/{} is undefined",
-                        module,
-                        fun,
-                        args.len()
-                    ))
+                    Err(format!("function {}.{}/{} is undefined", module, fun, args.len()))
                 }
             }
             _ => Err(format!("module {} is not available", module)),
         }
     }
 
-    fn has_def(&self, module: &str, name: &str, arity: usize) -> bool {
-        self.modules
-            .get(module)
-            .and_then(|t| t.get(&(name.to_string(), arity)))
-            .is_some()
+    fn has_def(&self, module: &str, name: &str) -> bool {
+        self.modules.get(module).map_or(false, |t| t.contains_key(name))
+    }
+
+    // Bind a clause's parameters (and any `*rest`) against the call arguments.
+    fn bind_params(&mut self, def: &Def, args: &[Value], env: &Env) -> Result<bool, String> {
+        let n = def.params.len();
+        match &def.rest {
+            None => {
+                if args.len() != n {
+                    return Ok(false);
+                }
+                self.match_seq(&def.params, args, env)
+            }
+            Some(rest_name) => {
+                if args.len() < n {
+                    return Ok(false);
+                }
+                if !self.match_seq(&def.params, &args[..n], env)? {
+                    return Ok(false);
+                }
+                env.borrow_mut().define(rest_name, Value::list(args[n..].to_vec()));
+                Ok(true)
+            }
+        }
     }
 
     fn call_user(&mut self, module: &str, name: &str, args: Vec<Value>) -> Result<Value, String> {
         let clauses = self
             .modules
             .get(module)
-            .and_then(|t| t.get(&(name.to_string(), args.len())))
+            .and_then(|t| t.get(name))
             .cloned()
             .unwrap_or_default();
         for def in &clauses {
             let call_env = new_env(Some(self.global.clone()));
-            if !self.match_seq(&def.params, &args, &call_env)? {
+            if !self.bind_params(def, &args, &call_env)? {
                 continue;
             }
             if self.guard_ok(&def.guard, &call_env)? {
@@ -377,6 +440,104 @@ impl Interp {
         ))
     }
 
+    // ---- Enum (higher-order; calls user functions) ----
+
+    fn apply_callable(&mut self, f: &Value, args: Vec<Value>) -> Result<Value, String> {
+        match f {
+            Value::Fun(fun) => self.call_fun(fun, args),
+            other => Err(format!("expected a function, got {}", other.type_name())),
+        }
+    }
+
+    // The higher-order Enum functions dispatch to a helper per operation; the
+    // rest (no function argument) fall through to `enum_pure`.
+    fn enum_call(&mut self, fun: &str, args: Vec<Value>) -> Result<Value, String> {
+        match (fun, args.as_slice()) {
+            ("map", [Value::List(l), f]) => self.enum_map(l, f),
+            ("filter", [Value::List(l), f]) => self.enum_keep(l, f, true),
+            ("reject", [Value::List(l), f]) => self.enum_keep(l, f, false),
+            ("each", [Value::List(l), f]) => self.enum_each(l, f),
+            ("reduce", [Value::List(l), acc, f]) => self.enum_reduce(l, acc.clone(), f),
+            ("find", [Value::List(l), f]) => self.enum_find(l, f),
+            ("count", [Value::List(l), f]) => self.enum_count(l, f),
+            ("any?", [Value::List(l), f]) => self.enum_quantify(l, f, false),
+            ("all?", [Value::List(l), f]) => self.enum_quantify(l, f, true),
+            ("sort_by", [Value::List(l), f]) => self.enum_sort_by(l, f),
+            _ => enum_pure(fun, &args),
+        }
+    }
+
+    fn enum_map(&mut self, l: &[Value], f: &Value) -> Result<Value, String> {
+        let mut out = Vec::with_capacity(l.len());
+        for x in l.iter() {
+            out.push(self.apply_callable(f, vec![x.clone()])?);
+        }
+        Ok(Value::list(out))
+    }
+
+    fn enum_keep(&mut self, l: &[Value], f: &Value, keep: bool) -> Result<Value, String> {
+        let mut out = Vec::new();
+        for x in l.iter() {
+            if self.apply_callable(f, vec![x.clone()])?.truthy() == keep {
+                out.push(x.clone());
+            }
+        }
+        Ok(Value::list(out))
+    }
+
+    fn enum_each(&mut self, l: &[Value], f: &Value) -> Result<Value, String> {
+        for x in l.iter() {
+            self.apply_callable(f, vec![x.clone()])?;
+        }
+        Ok(Value::Atom("ok".into()))
+    }
+
+    fn enum_reduce(&mut self, l: &[Value], acc: Value, f: &Value) -> Result<Value, String> {
+        let mut a = acc;
+        for x in l.iter() {
+            a = self.apply_callable(f, vec![a, x.clone()])?;
+        }
+        Ok(a)
+    }
+
+    fn enum_find(&mut self, l: &[Value], f: &Value) -> Result<Value, String> {
+        for x in l.iter() {
+            if self.apply_callable(f, vec![x.clone()])?.truthy() {
+                return Ok(x.clone());
+            }
+        }
+        Ok(Value::Nil)
+    }
+
+    fn enum_count(&mut self, l: &[Value], f: &Value) -> Result<Value, String> {
+        let mut n = 0i64;
+        for x in l.iter() {
+            if self.apply_callable(f, vec![x.clone()])?.truthy() {
+                n += 1;
+            }
+        }
+        Ok(Value::Int(n))
+    }
+
+    fn enum_sort_by(&mut self, l: &[Value], f: &Value) -> Result<Value, String> {
+        let mut keyed = Vec::with_capacity(l.len());
+        for x in l.iter() {
+            keyed.push((self.apply_callable(f, vec![x.clone()])?, x.clone()));
+        }
+        keyed.sort_by(|(a, _), (b, _)| cmp_values(a, b));
+        Ok(Value::list(keyed.into_iter().map(|(_, v)| v).collect()))
+    }
+
+    fn enum_quantify(&mut self, l: &[Value], f: &Value, require_all: bool) -> Result<Value, String> {
+        for x in l.iter() {
+            let t = self.apply_callable(f, vec![x.clone()])?.truthy();
+            if t != require_all {
+                return Ok(Value::Bool(!require_all));
+            }
+        }
+        Ok(Value::Bool(require_all))
+    }
+
     // ---- pattern matching ----
 
     fn match_pattern(&mut self, pat: &Pattern, val: &Value, env: &Env) -> Result<bool, String> {
@@ -390,6 +551,10 @@ impl Interp {
             Pattern::List(pats) => self.match_list(pats, val, env),
             Pattern::Cons(h, t) => self.match_cons(h, t, val, env),
             Pattern::Map(pairs) => self.match_map(pairs, val, env),
+            Pattern::Struct(name, fields) => self.match_struct(name, fields, val, env),
+            Pattern::And(a, b) => {
+                Ok(self.match_pattern(a, val, env)? && self.match_pattern(b, val, env)?)
+            }
             Pattern::Pin(name) => {
                 let pinned = env
                     .borrow()
@@ -429,6 +594,30 @@ impl Interp {
             }
             _ => Ok(false),
         }
+    }
+
+    fn match_struct(
+        &mut self,
+        name: &str,
+        fields: &[(String, Pattern)],
+        val: &Value,
+        env: &Env,
+    ) -> Result<bool, String> {
+        let Value::Map(mpairs) = val else {
+            return Ok(false);
+        };
+        // the value must be a struct of this module
+        match Value::map_get(mpairs, &Value::Atom("__struct__".into())) {
+            Some(Value::Atom(a)) if a == name => {}
+            _ => return Ok(false),
+        }
+        for (fname, subpat) in fields {
+            match Value::map_get(mpairs, &Value::Atom(fname.clone())) {
+                Some(v) if self.match_pattern(subpat, &v, env)? => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     fn match_map(
@@ -637,6 +826,143 @@ fn match_scalar(pat: &Pattern, val: &Value) -> bool {
         Pattern::Nil => matches!(val, Value::Nil),
         Pattern::Str(s) => matches!(val, Value::Str(t) if t == s),
         _ => false,
+    }
+}
+
+fn ok_tuple(v: Value) -> Value {
+    Value::tuple(vec![Value::Atom("ok".into()), v])
+}
+
+// Ordering for sort/sort_by: numbers numerically, else by string form.
+fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        _ => a.to_string().cmp(&b.to_string()),
+    }
+}
+
+// Enum functions that don't call a user function.
+fn enum_pure(fun: &str, args: &[Value]) -> Result<Value, String> {
+    match (fun, args) {
+        ("count", [Value::List(l)]) => Ok(Value::Int(l.len() as i64)),
+        ("sum", [Value::List(l)]) => {
+            let mut acc = Value::Int(0);
+            for x in l.iter() {
+                acc = arith(BinOp::Add, acc, x.clone())?;
+            }
+            Ok(acc)
+        }
+        ("join", [Value::List(l), Value::Str(sep)]) => Ok(Value::Str(join_list(l, sep))),
+        ("join", [Value::List(l)]) => Ok(Value::Str(join_list(l, ""))),
+        ("sort", [Value::List(l)]) => {
+            let mut v = (**l).clone();
+            v.sort_by(cmp_values);
+            Ok(Value::list(v))
+        }
+        ("reverse", [Value::List(l)]) => {
+            let mut v = (**l).clone();
+            v.reverse();
+            Ok(Value::list(v))
+        }
+        ("member?", [Value::List(l), x]) => {
+            Ok(Value::Bool(l.iter().any(|y| values_equal(y, x))))
+        }
+        _ => Err(format!("Enum.{}/{} is undefined", fun, args.len())),
+    }
+}
+
+fn join_list(l: &[Value], sep: &str) -> String {
+    l.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(sep)
+}
+
+fn string_call(fun: &str, args: Vec<Value>) -> Result<Value, String> {
+    match (fun, args.as_slice()) {
+        ("upcase", [Value::Str(s)]) => Ok(Value::Str(s.to_uppercase())),
+        ("downcase", [Value::Str(s)]) => Ok(Value::Str(s.to_lowercase())),
+        ("trim", [Value::Str(s)]) => Ok(Value::Str(s.trim().to_string())),
+        ("length", [Value::Str(s)]) => Ok(Value::Int(s.chars().count() as i64)),
+        ("reverse", [Value::Str(s)]) => Ok(Value::Str(s.chars().rev().collect())),
+        ("split", [Value::Str(s), Value::Str(sep)]) => {
+            Ok(Value::list(s.split(sep.as_str()).map(|p| Value::Str(p.to_string())).collect()))
+        }
+        ("split", [Value::Str(s)]) => {
+            Ok(Value::list(s.split_whitespace().map(|p| Value::Str(p.to_string())).collect()))
+        }
+        ("contains?", [Value::Str(s), Value::Str(sub)]) => Ok(Value::Bool(s.contains(sub.as_str()))),
+        ("starts_with?", [Value::Str(s), Value::Str(p)]) => Ok(Value::Bool(s.starts_with(p.as_str()))),
+        ("ends_with?", [Value::Str(s), Value::Str(p)]) => Ok(Value::Bool(s.ends_with(p.as_str()))),
+        ("replace", [Value::Str(s), Value::Str(a), Value::Str(b)]) => {
+            Ok(Value::Str(s.replace(a.as_str(), b)))
+        }
+        ("to_string", [v]) => Ok(Value::Str(v.to_string())),
+        _ => Err(format!("String.{}/{} is undefined", fun, args.len())),
+    }
+}
+
+fn map_call(fun: &str, args: Vec<Value>) -> Result<Value, String> {
+    match (fun, args.as_slice()) {
+        ("get", [Value::Map(m), k]) => Ok(Value::map_get(m, k).unwrap_or(Value::Nil)),
+        ("get", [Value::Map(m), k, default]) => {
+            Ok(Value::map_get(m, k).unwrap_or_else(|| default.clone()))
+        }
+        ("fetch", [Value::Map(m), k]) => Ok(match Value::map_get(m, k) {
+            Some(v) => ok_tuple(v),
+            None => Value::Atom("error".into()),
+        }),
+        ("put", [Value::Map(m), k, v]) => Ok(Value::Map(Rc::new(map_put(m, k.clone(), v.clone())))),
+        ("delete", [Value::Map(m), k]) => {
+            let kept = m.iter().filter(|(ek, _)| !values_equal(ek, k)).cloned().collect();
+            Ok(Value::Map(Rc::new(kept)))
+        }
+        ("keys", [Value::Map(m)]) => Ok(Value::list(m.iter().map(|(k, _)| k.clone()).collect())),
+        ("values", [Value::Map(m)]) => Ok(Value::list(m.iter().map(|(_, v)| v.clone()).collect())),
+        ("has_key?", [Value::Map(m), k]) => Ok(Value::Bool(Value::map_get(m, k).is_some())),
+        ("merge", [Value::Map(a), Value::Map(b)]) => {
+            let mut out = (**a).clone();
+            for (k, v) in b.iter() {
+                out = map_put(&out, k.clone(), v.clone());
+            }
+            Ok(Value::Map(Rc::new(out)))
+        }
+        _ => Err(format!("Map.{}/{} is undefined", fun, args.len())),
+    }
+}
+
+fn map_put(m: &[(Value, Value)], key: Value, val: Value) -> Vec<(Value, Value)> {
+    let mut out: Vec<(Value, Value)> = m.to_vec();
+    if let Some(slot) = out.iter_mut().find(|(k, _)| values_equal(k, &key)) {
+        slot.1 = val;
+    } else {
+        out.push((key, val));
+    }
+    out
+}
+
+fn list_call(fun: &str, args: Vec<Value>) -> Result<Value, String> {
+    match (fun, args.as_slice()) {
+        ("first", [Value::List(l)]) => Ok(l.first().cloned().unwrap_or(Value::Nil)),
+        ("last", [Value::List(l)]) => Ok(l.last().cloned().unwrap_or(Value::Nil)),
+        ("reverse", [Value::List(l)]) => {
+            let mut v = (**l).clone();
+            v.reverse();
+            Ok(Value::list(v))
+        }
+        ("at", [Value::List(l), Value::Int(i)]) => {
+            Ok(l.get(*i as usize).cloned().unwrap_or(Value::Nil))
+        }
+        ("member?", [Value::List(l), x]) => Ok(Value::Bool(l.iter().any(|y| values_equal(y, x)))),
+        _ => Err(format!("List.{}/{} is undefined", fun, args.len())),
+    }
+}
+
+fn integer_call(fun: &str, args: Vec<Value>) -> Result<Value, String> {
+    match (fun, args.as_slice()) {
+        ("to_string", [Value::Int(n)]) => Ok(Value::Str(n.to_string())),
+        ("parse", [Value::Str(s)]) => Ok(match s.trim().parse::<i64>() {
+            Ok(n) => ok_tuple(Value::Int(n)),
+            Err(_) => Value::Atom("error".into()),
+        }),
+        _ => Err(format!("Integer.{}/{} is undefined", fun, args.len())),
     }
 }
 

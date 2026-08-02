@@ -1,4 +1,7 @@
-# Allegro → Elixir-flavored functional language: rewrite plan
+# Presto — Elixir-flavored functional language: rewrite plan
+
+> Project renamed **allegro → presto**; source files use the **`.pr`**
+> extension. (Repo dir/git remote updated separately.)
 
 ## 1. Goal & non-goals
 
@@ -351,16 +354,18 @@ tuple/list/`[h|t]`/map destructure, qualified + local calls, `Kernel`/`IO`,
 arithmetic (`/` vs div/rem), comparison, `<>`/`++`/`--`, boolean, `if`, pipe.
 *Verified:* the phase-1 script runs; multi-clause/guards/`if` work.
 
-**Phase 2 — Control flow & anonymous functions.**
-`case`, `cond`, `with`, `unless`, `fn` + `.()` call, `&`/`&1` capture, pin `^`.
-(Multi-clause defs & guards already landed in phase 1.)
-*Verify:* `case` on `{:ok,_}/{:error,_}`, a `with` chain, `fn` passed and called.
+**Phase 2 — Control flow & anonymous functions. ✅ DONE.**
+`case`, `cond`, `with` (+else), `unless`, `fn` + `.()` call, `&`/`&1` and
+`&Mod.fun/n` capture, pin `^`, `IO.debug`/`inspect`/`write`.
+*Verified:* `case` on `{:ok,_}/{:error,_}`, `with` chain, `fn` passed and called.
 
-**Phase 3 — Structs & data std lib.**
-`defstruct` (user types wrapping data/primitives); `Enum`, `String`, `Map`,
-`List`, `Integer`, `IO`; `alias`/`import`; `*rest` variadic.
-*Verify:* `[1,2,3] |> Enum.map(fn x -> x*x end) |> Enum.sum()`; a struct
-round-trip; convention-based delegate/decorate via multi-clause + `_`.
+**Phase 3 — Structs & data std lib. ✅ DONE.**
+`defstruct` (defaults, literal/pattern/update, as-patterns, `*rest` variadic);
+`Enum` (map/filter/reject/each/reduce/find/count/any?/all?/sum/join/sort/
+sort_by/member?), `String`, `Map` (fetch→`{:ok,_}`/`:error`), `List`, `Integer`.
+*Verified:* `[1,2,3,4] |> Enum.map(fn x -> x*x end) |> Enum.sum()`; struct round-
+trip; `*rest`. (`alias`/`import` deferred to phase 4 where `Allegro.*` aliasing
+matters.)
 
 **Phase 4 — AI primitives + supervision.**
 Structs + modules for all primitives (`Allegro.*`, default-aliased), wired to

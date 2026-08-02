@@ -36,6 +36,7 @@ pub enum Tok {
     LBrace,
     RBrace,
     MapOpen, // %{
+    Percent, // %  (struct literal: %Alias{...})
     Comma,
     Dot,
     Bar,      // |  (cons / map update)

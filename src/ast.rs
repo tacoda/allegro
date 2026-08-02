@@ -44,6 +44,7 @@ pub enum Expr {
     Cons(Box<Expr>, Box<Expr>), // [head | tail]
     Tuple(Vec<Expr>),
     Map(Vec<(Expr, Expr)>),
+    Struct(String, Vec<(String, Expr)>), // %User{field: expr}
     Block(Vec<Expr>),
     Match(Box<Expr>, Box<Expr>), // pattern = value
     Binary(BinOp, Box<Expr>, Box<Expr>),
@@ -92,20 +93,30 @@ pub enum Pattern {
     List(Vec<Pattern>),
     Cons(Box<Pattern>, Box<Pattern>),
     Map(Vec<(Expr, Pattern)>), // key expression (evaluated) -> sub-pattern
+    Struct(String, Vec<(String, Pattern)>), // %User{field: pat}
     Pin(String),               // ^var — match against the variable's value
+    And(Box<Pattern>, Box<Pattern>), // `pat = pat` — both match the same value
 }
 
 #[derive(Debug, Clone)]
 pub struct Def {
     pub name: String,
     pub params: Vec<Pattern>,
+    pub rest: Option<String>, // trailing `*rest` variadic param, if any
     pub guard: Option<Expr>,
     pub body: Vec<Expr>,
     pub private: bool,
 }
 
+// The fields declared by `defstruct`, each with an optional default expression.
+pub type StructFields = Vec<(String, Option<Expr>)>;
+
 #[derive(Debug, Clone)]
 pub enum TopItem {
-    Module { name: String, defs: Vec<Def> },
+    Module {
+        name: String,
+        defs: Vec<Def>,
+        struct_fields: Option<StructFields>,
+    },
     Expr(Expr),
 }

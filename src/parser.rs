@@ -73,12 +73,30 @@ impl Parser {
         self.eat(&Tok::Do)?;
         self.skip_newlines();
         let mut defs = Vec::new();
-        while self.check(&Tok::Def) || self.check(&Tok::Defp) {
-            defs.push(self.def()?);
+        let mut struct_fields = None;
+        loop {
+            match self.peek() {
+                Tok::Def | Tok::Defp => defs.push(self.def()?),
+                Tok::Ident(s) if s == "defstruct" => struct_fields = Some(self.defstruct()?),
+                _ => break,
+            }
             self.skip_newlines();
         }
         self.eat(&Tok::End)?;
-        Ok(TopItem::Module { name, defs })
+        Ok(TopItem::Module {
+            name,
+            defs,
+            struct_fields,
+        })
+    }
+
+    // `defstruct [:a, :b]` or `defstruct [a: default, b: default]`.
+    fn defstruct(&mut self) -> Result<crate::ast::StructFields, String> {
+        self.advance(); // defstruct
+        let Expr::List(items) = self.expr()? else {
+            return Err("defstruct expects a list of fields".into());
+        };
+        items.into_iter().map(defstruct_field).collect()
     }
 
     // `Alias(.Alias)*`
@@ -110,10 +128,10 @@ impl Parser {
         let private = self.check(&Tok::Defp);
         self.advance(); // def / defp
         let name = self.ident_name()?;
-        let params = if self.check(&Tok::LParen) {
+        let (params, rest) = if self.check(&Tok::LParen) {
             self.pattern_params()?
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         let guard = if self.check(&Tok::When) {
             self.advance();
@@ -125,6 +143,7 @@ impl Parser {
         Ok(Def {
             name,
             params,
+            rest,
             guard,
             body,
             private,
@@ -152,12 +171,20 @@ impl Parser {
         }
     }
 
-    // Parameters are patterns: parse as expressions, convert to patterns.
-    fn pattern_params(&mut self) -> Result<Vec<Pattern>, String> {
+    // Parameters are patterns; an optional trailing `*rest` collects the
+    // remaining arguments into a list.
+    fn pattern_params(&mut self) -> Result<(Vec<Pattern>, Option<String>), String> {
         self.eat(&Tok::LParen)?;
         self.skip_newlines();
         let mut params = Vec::new();
+        let mut rest = None;
         while !self.check(&Tok::RParen) {
+            if self.check(&Tok::Star) {
+                self.advance();
+                rest = Some(self.ident_name()?);
+                self.skip_newlines();
+                break;
+            }
             let e = self.expr()?;
             params.push(expr_to_pattern(e)?);
             self.skip_newlines();
@@ -167,7 +194,7 @@ impl Parser {
             }
         }
         self.eat(&Tok::RParen)?;
-        Ok(params)
+        Ok((params, rest))
     }
 
     // A block: newline/`;`-separated expressions until a terminator.
@@ -384,6 +411,7 @@ impl Parser {
             Tok::LBracket => self.list_literal(),
             Tok::LBrace => self.tuple_literal(),
             Tok::MapOpen => self.map_literal(),
+            Tok::Percent => self.struct_literal(),
             Tok::Fn => self.fn_literal(),
             Tok::If => self.if_expr(),
             Tok::Unless => self.unless_expr(),
@@ -473,11 +501,24 @@ impl Parser {
             if self.check(&Tok::RBracket) {
                 break;
             }
-            items.push(self.expr()?);
+            items.push(self.list_item()?);
             self.skip_newlines();
         }
         self.eat(&Tok::RBracket)?;
         Ok(Expr::List(items))
+    }
+
+    // A list element: a normal expression, or a `key: value` keyword pair
+    // (which becomes a `{:key, value}` tuple), so `[:a, k: v]` is allowed.
+    fn list_item(&mut self) -> Result<Expr, String> {
+        if let Tok::KwKey(k) = self.peek().clone() {
+            self.advance();
+            self.skip_newlines();
+            let v = self.expr()?;
+            Ok(Expr::Tuple(vec![Expr::Atom(k), v]))
+        } else {
+            self.expr()
+        }
     }
 
     fn tuple_literal(&mut self) -> Result<Expr, String> {
@@ -521,6 +562,31 @@ impl Parser {
         }
         self.eat(&Tok::RBrace)?;
         Ok(Expr::Map(pairs))
+    }
+
+    // `%User{field: expr, ...}` — a struct literal.
+    fn struct_literal(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::Percent)?;
+        let name = self.module_path()?;
+        self.eat(&Tok::LBrace)?;
+        self.skip_newlines();
+        let mut fields = Vec::new();
+        while !self.check(&Tok::RBrace) {
+            match self.advance() {
+                Tok::KwKey(k) => {
+                    self.skip_newlines();
+                    fields.push((k, self.expr()?));
+                }
+                other => return Err(format!("expected `field:`, found {:?}", other)),
+            }
+            self.skip_newlines();
+            if self.check(&Tok::Comma) {
+                self.advance();
+                self.skip_newlines();
+            }
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(Expr::Struct(name, fields))
     }
 
     // `key: v, key2: v2` — used inside a keyword list literal.
@@ -821,6 +887,21 @@ fn pipe_into(left: Expr, rhs: Expr) -> Result<Expr, String> {
     }
 }
 
+// One `defstruct` field: `:atom` (no default) or `name: default`.
+fn defstruct_field(it: Expr) -> Result<(String, Option<Expr>), String> {
+    match it {
+        Expr::Atom(a) => Ok((a, None)),
+        Expr::Tuple(mut pair) if pair.len() == 2 => {
+            let default = pair.pop().unwrap();
+            match pair.pop().unwrap() {
+                Expr::Atom(k) => Ok((k, Some(default))),
+                _ => Err("defstruct field name must be an atom".into()),
+            }
+        }
+        _ => Err("defstruct fields must be `:atom` or `name: default`".into()),
+    }
+}
+
 fn slot_name(i: usize) -> String {
     format!("$c{}", i)
 }
@@ -850,6 +931,9 @@ fn max_slot(e: &Expr) -> usize {
 // Convert an expression used in pattern position into a Pattern.
 pub fn expr_to_pattern(e: Expr) -> Result<Pattern, String> {
     Ok(match e {
+        Expr::Match(l, r) => {
+            Pattern::And(Box::new(expr_to_pattern(*l)?), Box::new(expr_to_pattern(*r)?))
+        }
         Expr::Pin(name) => Pattern::Pin(name),
         Expr::Var(name) if name == "_" || name.starts_with('_') => {
             if name == "_" {
@@ -883,6 +967,13 @@ pub fn expr_to_pattern(e: Expr) -> Result<Pattern, String> {
                 out.push((k, expr_to_pattern(v)?));
             }
             Pattern::Map(out)
+        }
+        Expr::Struct(name, fields) => {
+            let mut out = Vec::new();
+            for (k, v) in fields {
+                out.push((k, expr_to_pattern(v)?));
+            }
+            Pattern::Struct(name, out)
         }
         other => return Err(format!("invalid pattern: {:?}", other)),
     })

@@ -111,6 +111,7 @@ fn one_char(ch: char) -> Option<Tok> {
         '.' => Tok::Dot,
         ':' => Tok::Colon,
         '|' => Tok::Bar,
+        '%' => Tok::Percent,
         '&' => Tok::Amp,
         '^' => Tok::Caret,
         '=' => Tok::Match,

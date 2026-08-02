@@ -21,7 +21,7 @@ fn main() {
         _ => None,
     };
     let Some(path) = path else {
-        eprintln!("usage: allegro run <file.al>");
+        eprintln!("usage: presto run <file.pr>");
         exit(2);
     };
 
