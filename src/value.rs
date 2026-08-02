@@ -73,6 +73,7 @@ impl Value {
         match self {
             Value::Str(s) => format!("{:?}", s),
             Value::Atom(a) => format!(":{}", a),
+            Value::Nil => "nil".to_string(),
             Value::List(items) => {
                 let inner: Vec<String> = items.iter().map(|v| v.inspect()).collect();
                 format!("[{}]", inner.join(", "))

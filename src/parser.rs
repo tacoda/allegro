@@ -230,13 +230,25 @@ impl Parser {
 
     fn pipe_expr(&mut self) -> Result<Expr, String> {
         let mut left = self.or_expr()?;
-        while self.check(&Tok::Pipe) {
+        // A `|>` may start on the next line — treat a newline before it as a
+        // continuation of the pipe rather than a statement break.
+        while self.continues_with(&Tok::Pipe) {
+            self.skip_newlines();
             self.advance();
             self.skip_newlines();
             let rhs = self.or_expr()?;
             left = pipe_into(left, rhs)?;
         }
         Ok(left)
+    }
+
+    // True if the next non-newline token is `tok`, without consuming anything.
+    fn continues_with(&self, tok: &Tok) -> bool {
+        let mut i = self.pos;
+        while matches!(self.toks.get(i), Some(Tok::Newline)) {
+            i += 1;
+        }
+        self.toks.get(i) == Some(tok)
     }
 
     fn or_expr(&mut self) -> Result<Expr, String> {
