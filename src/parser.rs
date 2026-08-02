@@ -1,4 +1,7 @@
-use crate::ast::{BinOp, CaseClause, Def, Expr, FnClause, ForClause, Pattern, StrPart, TopItem, UnOp};
+use crate::ast::{
+    BinOp, CaseClause, Def, Expr, FnClause, ForClause, Pattern, StrPart, TopItem, UnOp,
+};
+use crate::patterns::expr_to_pattern;
 use crate::token::Tok;
 
 pub fn parse(toks: Vec<Tok>) -> Result<Vec<TopItem>, String> {
@@ -338,6 +341,14 @@ impl Parser {
     fn postfix(&mut self) -> Result<Expr, String> {
         let mut e = self.primary()?;
         loop {
+            // bracket access `base[key]` — same line only (newline ends it)
+            if self.check(&Tok::LBracket) {
+                self.advance();
+                let key = self.expr()?;
+                self.eat(&Tok::RBracket)?;
+                e = Expr::Index(Box::new(e), Box::new(key));
+                continue;
+            }
             if !self.check(&Tok::Dot) {
                 break;
             }
@@ -542,36 +553,79 @@ impl Parser {
     fn map_literal(&mut self) -> Result<Expr, String> {
         self.eat(&Tok::MapOpen)?;
         self.skip_newlines();
-        let mut pairs = Vec::new();
-        while !self.check(&Tok::RBrace) {
-            if let Tok::KwKey(k) = self.peek().clone() {
-                self.advance();
-                self.skip_newlines();
-                let v = self.expr()?;
-                pairs.push((Expr::Atom(k), v));
-            } else {
-                let key = self.expr()?;
-                self.eat(&Tok::FatArrow)?;
-                self.skip_newlines();
-                let v = self.expr()?;
-                pairs.push((key, v));
-            }
-            self.skip_newlines();
-            if self.check(&Tok::Comma) {
-                self.advance();
-                self.skip_newlines();
-            }
+        // update form `%{base | k: v, ...}`: the base is an expression, never a
+        // `k:` key, and is followed by `|`.
+        if let Some(update) = self.try_update(&Tok::RBrace)? {
+            return Ok(update);
         }
+        let pairs = self.map_pairs(&Tok::RBrace)?;
         self.eat(&Tok::RBrace)?;
         Ok(Expr::Map(pairs))
     }
 
-    // `%User{field: expr, ...}` — a struct literal.
+    // If the next tokens are `<expr> |`, parse a map/struct update and return it.
+    fn try_update(&mut self, end: &Tok) -> Result<Option<Expr>, String> {
+        if self.check(end) || matches!(self.peek(), Tok::KwKey(_)) {
+            return Ok(None);
+        }
+        let base = self.expr()?;
+        if !self.check(&Tok::Bar) {
+            // not an update: `base` is the first `key => value` key.
+            self.eat(&Tok::FatArrow)?;
+            self.skip_newlines();
+            let v = self.expr()?;
+            self.eat_comma();
+            let mut pairs = vec![(base, v)];
+            pairs.extend(self.map_pairs(end)?);
+            self.eat(end)?;
+            return Ok(Some(Expr::Map(pairs)));
+        }
+        self.advance(); // |
+        self.skip_newlines();
+        let updates = self.map_pairs(end)?;
+        self.eat(end)?;
+        Ok(Some(Expr::MapUpdate(Box::new(base), updates)))
+    }
+
+    // `key => v` / `key: v` pairs until `end`.
+    fn map_pairs(&mut self, end: &Tok) -> Result<Vec<(Expr, Expr)>, String> {
+        let mut pairs = Vec::new();
+        while !self.check(end) {
+            if let Tok::KwKey(k) = self.peek().clone() {
+                self.advance();
+                self.skip_newlines();
+                pairs.push((Expr::Atom(k), self.expr()?));
+            } else {
+                let key = self.expr()?;
+                self.eat(&Tok::FatArrow)?;
+                self.skip_newlines();
+                pairs.push((key, self.expr()?));
+            }
+            self.skip_newlines();
+            self.eat_comma();
+        }
+        Ok(pairs)
+    }
+
+    fn eat_comma(&mut self) {
+        if self.check(&Tok::Comma) {
+            self.advance();
+            self.skip_newlines();
+        }
+    }
+
+    // `%User{field: expr, ...}` — a struct literal, or `%User{base | field: v}`
+    // — a struct update.
     fn struct_literal(&mut self) -> Result<Expr, String> {
         self.eat(&Tok::Percent)?;
         let name = self.module_path()?;
         self.eat(&Tok::LBrace)?;
         self.skip_newlines();
+        // update form `%User{base | field: v}` reuses map-update semantics; the
+        // base already carries its `__struct__` tag.
+        if let Some(update) = self.try_update(&Tok::RBrace)? {
+            return Ok(update);
+        }
         let mut fields = Vec::new();
         while !self.check(&Tok::RBrace) {
             match self.advance() {
@@ -582,10 +636,7 @@ impl Parser {
                 other => return Err(format!("expected `field:`, found {:?}", other)),
             }
             self.skip_newlines();
-            if self.check(&Tok::Comma) {
-                self.advance();
-                self.skip_newlines();
-            }
+            self.eat_comma();
         }
         self.eat(&Tok::RBrace)?;
         Ok(Expr::Struct(name, fields))
@@ -994,64 +1045,6 @@ fn max_slot(e: &Expr) -> usize {
 }
 
 // Convert an expression used in pattern position into a Pattern.
-pub fn expr_to_pattern(e: Expr) -> Result<Pattern, String> {
-    Ok(match e {
-        Expr::Match(l, r) => {
-            Pattern::And(Box::new(expr_to_pattern(*l)?), Box::new(expr_to_pattern(*r)?))
-        }
-        Expr::Pin(name) => Pattern::Pin(name),
-        Expr::Var(name) if name == "_" || name.starts_with('_') => {
-            if name == "_" {
-                Pattern::Wildcard
-            } else {
-                Pattern::Var(name)
-            }
-        }
-        Expr::Var(name) => Pattern::Var(name),
-        Expr::Int(n) => Pattern::Int(n),
-        Expr::Float(f) => Pattern::Float(f),
-        Expr::Atom(a) => Pattern::Atom(a),
-        Expr::Bool(b) => Pattern::Bool(b),
-        Expr::Nil => Pattern::Nil,
-        Expr::Str(parts) => match single_literal(&parts) {
-            Some(s) => Pattern::Str(s),
-            None => return Err("string interpolation is not allowed in a pattern".into()),
-        },
-        Expr::Tuple(items) => {
-            Pattern::Tuple(items.into_iter().map(expr_to_pattern).collect::<Result<_, _>>()?)
-        }
-        Expr::List(items) => {
-            Pattern::List(items.into_iter().map(expr_to_pattern).collect::<Result<_, _>>()?)
-        }
-        Expr::Cons(h, t) => {
-            Pattern::Cons(Box::new(expr_to_pattern(*h)?), Box::new(expr_to_pattern(*t)?))
-        }
-        Expr::Map(pairs) => {
-            let mut out = Vec::new();
-            for (k, v) in pairs {
-                out.push((k, expr_to_pattern(v)?));
-            }
-            Pattern::Map(out)
-        }
-        Expr::Struct(name, fields) => {
-            let mut out = Vec::new();
-            for (k, v) in fields {
-                out.push((k, expr_to_pattern(v)?));
-            }
-            Pattern::Struct(name, out)
-        }
-        other => return Err(format!("invalid pattern: {:?}", other)),
-    })
-}
-
-fn single_literal(parts: &[StrPart]) -> Option<String> {
-    match parts {
-        [] => Some(String::new()),
-        [StrPart::Lit(s)] => Some(s.clone()),
-        _ => None,
-    }
-}
-
 // Split a raw string into literal chunks and `#{ expr }` interpolations.
 fn parse_interpolation(raw: &str) -> Result<Vec<StrPart>, String> {
     let chars: Vec<char> = raw.chars().collect();

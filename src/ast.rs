@@ -44,7 +44,9 @@ pub enum Expr {
     Cons(Box<Expr>, Box<Expr>), // [head | tail]
     Tuple(Vec<Expr>),
     Map(Vec<(Expr, Expr)>),
+    MapUpdate(Box<Expr>, Vec<(Expr, Expr)>), // %{base | key => v} / %{base | key: v}
     Struct(String, Vec<(String, Expr)>), // %User{field: expr}
+    Index(Box<Expr>, Box<Expr>),         // base[key] — map/keyword/list access
     Block(Vec<Expr>),
     Match(Box<Expr>, Box<Expr>), // pattern = value
     Binary(BinOp, Box<Expr>, Box<Expr>),

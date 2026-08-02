@@ -61,8 +61,9 @@ for x <- [1, 2, 3], x > 1, do: x * x  # [4, 9]
 
 Values: integers/floats, atoms (`:ok`, and `true`/`false`/`nil`), strings with
 `"#{interpolation}"`, lists `[h | t]`, tuples `{:ok, v}`, maps `%{a: 1}`
-(accessed `m.a`), structs `%Point{x: 1}` (`defstruct [:x, :y]`), and functions
-`fn x -> x end` (called `f.(x)`, captured `&Mod.fun/2`, shorthand `&(&1 + 1)`).
+(accessed `m.a` or `m[:a]`, updated `%{m | a: 2}`), structs `%Point{x: 1}`
+(`defstruct [:x, :y]`, updated `%Point{p | x: 2}`), and functions `fn x -> x
+end` (called `f.(x)`, captured `&Mod.fun/2`, shorthand `&(&1 + 1)`).
 
 Standard library — data-first so everything pipes: `Enum` (map, filter, reject,
 reduce, find, count, any?, all?, sum, join, sort, sort_by, member?), `String`,
@@ -71,8 +72,7 @@ guards, …), `IO` (puts, inspect).
 
 **Extensions beyond Elixir-lite:** a trailing `*rest` variadic parameter
 (`def log(level, *rest)`), and the process model below. Not (yet) present:
-sigils, `alias`/`import`, map/struct update (`%{m | k: v}`), bracket access
-(`m[:k]` — use `m.k` or `Map.get`).
+sigils, `alias`/`import`.
 
 ---
 
@@ -247,5 +247,4 @@ OTP-lite (`Supervisor`/`Orchestrator`/`Factory`/`Retry`/`Loop`), `StateGraph`
 with checkpointing, and the OpenAI-backed AI primitives.
 
 See `PLAN.md` for the full design, locked decisions, and roadmap. Deferred:
-sigils, `alias`/`import`, map/struct update, `Memory`, `for`
-`into:`/`uniq:`/`reduce:`.
+sigils, `alias`/`import`, `Memory`, `for` `into:`/`uniq:`/`reduce:`.

@@ -7,6 +7,7 @@ mod lexer;
 mod natives;
 mod openai;
 mod parser;
+mod patterns;
 mod prims;
 mod scheduler;
 mod token;

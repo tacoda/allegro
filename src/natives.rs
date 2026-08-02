@@ -96,6 +96,30 @@ pub fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
     Ok(Value::Bool(result))
 }
 
+// Bracket access `base[key]`: map lookup, keyword-list lookup, or list index.
+// Missing keys (and indexing `nil`) yield `nil`, matching Elixir's Access.
+pub fn index(base: &Value, key: &Value) -> Result<Value, String> {
+    match base {
+        Value::Map(m) => Ok(Value::map_get(m, key).unwrap_or(Value::Nil)),
+        Value::Nil => Ok(Value::Nil),
+        Value::List(l) => Ok(index_list(l, key)),
+        other => Err(format!("cannot index a {}", other.type_name())),
+    }
+}
+
+fn index_list(l: &[Value], key: &Value) -> Value {
+    // integer subscript, else keyword-list access (`[key: v]`)
+    if let Value::Int(i) = key {
+        return l.get(*i as usize).cloned().unwrap_or(Value::Nil);
+    }
+    l.iter()
+        .find_map(|it| match it {
+            Value::Tuple(t) if t.len() == 2 && values_equal(&t[0], key) => Some(t[1].clone()),
+            _ => None,
+        })
+        .unwrap_or(Value::Nil)
+}
+
 // ---- native modules ----
 
 pub fn io_call(fun: &str, args: Vec<Value>) -> Result<Value, String> {
@@ -297,7 +321,7 @@ pub fn map_call(fun: &str, args: Vec<Value>) -> Result<Value, String> {
     }
 }
 
-fn map_put(m: &[(Value, Value)], key: Value, val: Value) -> Vec<(Value, Value)> {
+pub fn map_put(m: &[(Value, Value)], key: Value, val: Value) -> Vec<(Value, Value)> {
     let mut out: Vec<(Value, Value)> = m.to_vec();
     if let Some(slot) = out.iter_mut().find(|(k, _)| values_equal(k, &key)) {
         slot.1 = val;

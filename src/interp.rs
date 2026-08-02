@@ -6,7 +6,7 @@ use crate::ast::{
     BinOp, CaseClause, Def, Expr, ForClause, Pattern, StrPart, StructFields, TopItem, UnOp,
 };
 use crate::natives::*;
-use crate::parser::expr_to_pattern;
+use crate::patterns::expr_to_pattern;
 use crate::scheduler::{Handler, HandlerRef, Pid, Scheduler};
 use crate::value::{new_env, values_equal, Env, Fun, Value};
 
@@ -112,7 +112,9 @@ impl Interp {
             Expr::Cons(h, t) => self.eval_cons(h, t, env),
             Expr::Tuple(items) => Ok(Value::tuple(self.eval_args(items, env)?)),
             Expr::Map(pairs) => self.eval_map(pairs, env),
+            Expr::MapUpdate(base, updates) => self.eval_map_update(base, updates, env),
             Expr::Struct(name, fields) => self.eval_struct(name, fields, env),
+            Expr::Index(base, key) => self.eval_index(base, key, env),
             Expr::Block(stmts) => self.eval_block(stmts, env),
             Expr::Match(lhs, rhs) => self.eval_match(lhs, rhs, env),
             Expr::Binary(op, l, r) => self.eval_binary(*op, l, r, env),
@@ -534,6 +536,32 @@ impl Interp {
             }
         }
         Ok(Value::Map(Rc::new(out)))
+    }
+
+    // `%{base | k => v, ...}` / `%Struct{base | field: v}` — update an existing
+    // map or struct; a struct's `__struct__` tag rides along in its base.
+    fn eval_map_update(
+        &mut self,
+        base: &Expr,
+        updates: &[(Expr, Expr)],
+        env: &Env,
+    ) -> Result<Value, String> {
+        let mut pairs = match self.eval(base, env)? {
+            Value::Map(m) => (*m).clone(),
+            other => return Err(format!("cannot update a {} with `%{{ | }}`", other.type_name())),
+        };
+        for (ke, ve) in updates {
+            let key = self.eval(ke, env)?;
+            let val = self.eval(ve, env)?;
+            pairs = map_put(&pairs, key, val);
+        }
+        Ok(Value::Map(Rc::new(pairs)))
+    }
+
+    fn eval_index(&mut self, base: &Expr, key: &Expr, env: &Env) -> Result<Value, String> {
+        let b = self.eval(base, env)?;
+        let k = self.eval(key, env)?;
+        index(&b, &k)
     }
 
     fn eval_struct(
