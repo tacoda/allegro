@@ -18,6 +18,7 @@ pub enum Value {
     Map(Rc<Vec<(Value, Value)>>), // insertion order; keys deduped on build
     Fun(Rc<Fun>),
     Pid(u64), // a lightweight process id in the actor scheduler
+    Ref(Rc<RefCell<Value>>), // a mutable cell (Store) for cross-call state
 }
 
 // An anonymous function: clauses tried in order, closing over its definition
@@ -47,6 +48,7 @@ impl Value {
             Value::Map(_) => "map",
             Value::Fun(_) => "function",
             Value::Pid(_) => "pid",
+            Value::Ref(_) => "reference",
         }
     }
 
@@ -98,6 +100,7 @@ impl fmt::Display for Value {
             Value::List(_) | Value::Tuple(_) | Value::Map(_) => write!(f, "{}", self.inspect()),
             Value::Fun(_) => write!(f, "#Function"),
             Value::Pid(id) => write!(f, "#PID<{}>", id),
+            Value::Ref(_) => write!(f, "#Store"),
         }
     }
 }
@@ -140,6 +143,7 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Nil, Value::Nil) => true,
         (Value::Pid(x), Value::Pid(y)) => x == y,
+        (Value::Ref(x), Value::Ref(y)) => Rc::ptr_eq(x, y),
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::List(x), Value::List(y)) | (Value::Tuple(x), Value::Tuple(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| values_equal(p, q))

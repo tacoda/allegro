@@ -1,9 +1,10 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::{BinOp, CaseClause, Def, Expr, Pattern, StrPart, StructFields, TopItem, UnOp};
 use crate::parser::expr_to_pattern;
-use crate::scheduler::{Handler, HandlerRef, Scheduler};
+use crate::scheduler::{Handler, HandlerRef, Pid, Scheduler};
 use crate::value::{new_env, values_equal, Env, Fun, Value};
 
 pub struct Interp {
@@ -270,7 +271,7 @@ impl Interp {
                 ))
             }
         };
-        Ok(Value::Pid(self.sched.spawn(h, state)))
+        Ok(Value::Pid(self.sched.spawn(h, state).id()))
     }
 
     // `receive` matches the current process's mailbox against the clauses. On a
@@ -299,7 +300,7 @@ impl Interp {
     fn match_mailbox(
         &mut self,
         clauses: &[CaseClause],
-        me: u64,
+        me: Pid,
         env: &Env,
     ) -> Result<Option<Value>, String> {
         for (idx, msg) in self.sched.mailbox_snapshot(me).into_iter().enumerate() {
@@ -336,7 +337,7 @@ impl Interp {
     // Deliver one message to a process: run its handler with the process's
     // current state. A handler that raises (returns Err) crashes the process
     // rather than aborting the whole program.
-    fn step(&mut self, pid: u64, msg: Value) -> Result<(), String> {
+    fn step(&mut self, pid: Pid, msg: Value) -> Result<(), String> {
         let handler = match self.sched.handler_of(pid) {
             Some(h) => h,
             None => return Ok(()),
@@ -359,7 +360,7 @@ impl Interp {
 
     // Interpret a handler's return: `{:noreply, s}` updates state,
     // `{:stop, reason[, s]}` terminates, anything else becomes the new state.
-    fn apply_return(&mut self, pid: u64, ret: Value) {
+    fn apply_return(&mut self, pid: Pid, ret: Value) {
         if let Value::Tuple(t) = &ret {
             match t.as_slice() {
                 [Value::Atom(a), s] if a == "noreply" => {
@@ -379,14 +380,52 @@ impl Interp {
     }
 
     // Kill a process and notify its monitors with `{:DOWN, pid, reason}`.
-    fn terminate(&mut self, pid: u64, reason: Value) {
+    fn terminate(&mut self, pid: Pid, reason: Value) {
         for watcher in self.sched.kill(pid) {
             let down = Value::tuple(vec![
                 Value::Atom("DOWN".into()),
-                Value::Pid(pid),
+                Value::Pid(pid.id()),
                 reason.clone(),
             ]);
             self.sched.deliver(watcher, down);
+        }
+    }
+
+    // `Process.register/2`, `Process.whereis/1` (the registry); `sleep/1` and
+    // any other Process functions delegate to the plain native.
+    fn process_module(&mut self, fun: &str, args: Vec<Value>) -> Result<Value, String> {
+        match (fun, args.as_slice()) {
+            ("register", [Value::Pid(pid), Value::Atom(name)]) => {
+                self.sched.register(name.clone(), Pid(*pid));
+                Ok(Value::Atom("ok".into()))
+            }
+            ("whereis", [Value::Atom(name)]) => Ok(self
+                .sched
+                .whereis(name)
+                .map(|p| Value::Pid(p.id()))
+                .unwrap_or(Value::Nil)),
+            _ => process_call(fun, args),
+        }
+    }
+
+    // `Store` — a mutable cell for state that must persist across calls and
+    // process restarts (values are otherwise immutable).
+    fn store_call(&mut self, fun: &str, args: Vec<Value>) -> Result<Value, String> {
+        match (fun, args.as_slice()) {
+            ("new", []) => Ok(Value::Ref(Rc::new(RefCell::new(Value::Nil)))),
+            ("new", [init]) => Ok(Value::Ref(Rc::new(RefCell::new(init.clone())))),
+            ("get", [Value::Ref(cell)]) => Ok(cell.borrow().clone()),
+            ("put", [Value::Ref(cell), v]) => {
+                *cell.borrow_mut() = v.clone();
+                Ok(v.clone())
+            }
+            ("update", [Value::Ref(cell), Value::Fun(f)]) => {
+                let current = cell.borrow().clone();
+                let next = self.call_fun(f, vec![current])?;
+                *cell.borrow_mut() = next.clone();
+                Ok(next)
+            }
+            _ => Err(format!("Store.{}/{} is undefined", fun, args.len())),
         }
     }
 
@@ -554,17 +593,24 @@ impl Interp {
         match (name, args) {
             ("spawn", [handler]) => Ok(Some(self.spawn_proc(handler, Value::Nil)?)),
             ("spawn", [handler, state]) => Ok(Some(self.spawn_proc(handler, state.clone())?)),
-            ("self", []) => Ok(Some(Value::Pid(self.sched.current))),
+            ("self", []) => Ok(Some(Value::Pid(self.sched.current.id()))),
             ("send", [Value::Pid(pid), msg]) => {
-                self.sched.deliver(*pid, msg.clone());
+                self.sched.deliver(Pid(*pid), msg.clone());
                 Ok(Some(msg.clone()))
             }
+            ("send", [Value::Atom(name), msg]) => match self.sched.whereis(name) {
+                Some(pid) => {
+                    self.sched.deliver(pid, msg.clone());
+                    Ok(Some(msg.clone()))
+                }
+                None => Err(format!("send/2: no process registered as :{}", name)),
+            },
             ("send", [other, _]) => {
-                Err(format!("send/2 expects a pid, got a {}", other.type_name()))
+                Err(format!("send/2 expects a pid or registered name, got a {}", other.type_name()))
             }
             ("monitor", [Value::Pid(pid)]) => {
                 let me = self.sched.current;
-                self.sched.monitor(me, *pid);
+                self.sched.monitor(me, Pid(*pid));
                 Ok(Some(Value::Pid(*pid)))
             }
             _ => Ok(None),
@@ -580,7 +626,8 @@ impl Interp {
             "Map" => map_call(fun, args),
             "List" => list_call(fun, args),
             "Integer" => integer_call(fun, args),
-            "Process" => process_call(fun, args),
+            "Process" => self.process_module(fun, args),
+            "Store" => self.store_call(fun, args),
             _ if crate::prims::is_ai_module(module) => {
                 crate::prims::dispatch(self, module, fun, args)
             }
