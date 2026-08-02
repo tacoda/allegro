@@ -1,334 +1,251 @@
-# allegro
+# Allegro
 
-A small Ruby-like language for composing **agents, harnesses, graphs, and
-runner queues**. Primitives are classes: build with `.new`, subclass for reuse,
-mix in modules for shared behavior, then invoke.
+**Allegro is a language to easily build agent harnesses.**
 
-```ruby
-bot = Agent.new(system: "You are terse.")   # model defaults from the MODEL env var
+An Elixir-flavored functional language for composing AI agents into harnesses.
+The agentic primitives (`Agent`, `Tool`, `Harness`) and an OTP-lite process
+model (`Supervisor`, `Orchestrator`, `Factory`, `StateGraph`) compose into
+full-scale systems — that composition is the point of the language, and the
+part worth learning. It runs on a tree-walking interpreter in Rust, backed by
+the OpenAI API.
 
-puts bot.run("Capital of France?").content   # => Paris.
+```elixir
+agent = Agent.new(system: "You are terse. One short sentence.")
+
+{:ok, msg} = "What is the capital of France?" |> Agent.run(agent)
+IO.puts(msg.content)          # => Paris.
 ```
 
-Agents are backed by the OpenAI Chat Completions API. Set `OPENAI_API_KEY` in your
-environment. `model:` defaults to the `MODEL` env var (else `gpt-4o-mini`) and
-`provider:` to the `PROVIDER` env var (else `openai`), so an agent needs no
-explicit config to run.
+Agents default their model from the `MODEL` env var (else `gpt-4o-mini`), the
+provider from `PROVIDER` (else `openai`), and the key from `OPENAI_API_KEY`.
 
-## Run
+## Build & run
 
 ```bash
 cargo build --release
-OPENAI_API_KEY=sk-... ./target/release/allegro run examples/workflow.al
+./target/release/allegro run examples/comprehensions.al               # no network
+OPENAI_API_KEY=sk-... ./target/release/allegro run examples/support_system.al
 ```
 
-## Language
+A program is mostly module definitions with a single invoke line at the bottom.
+Files use the `.al` extension; `#` starts a comment.
 
-Ruby-flavored: paren-less calls, `def ... end`, `if/elsif/else/end`, `while`, `for … in`,
-`#` comments, blocks close with `end`. Values: numbers, strings, `true`/`false`, `nil`,
-arrays `[…]`, hashes `{ key: value }`.
+---
 
-```ruby
-x = 3
-if x < 5
-  puts "small"
+## The language in a minute
+
+If you know Elixir, you already know most of this. Same shapes: `defmodule` with
+multi-clause, guarded, arity-aware `def`; `=` is pattern match; `|>` pipes;
+`case`/`cond`/`with`/`if`; `for` comprehensions; `{:ok, v}` / `{:error, r}`
+result tuples.
+
+```elixir
+defmodule Math do
+  def add(a, b), do: a + b
+
+  def factorial(0), do: 1
+  def factorial(n) when n > 0, do: n * factorial(n - 1)
 end
 
-for n in range(1, 4)
-  puts n            # 1 2 3
+[1, 2, 3, 4]
+|> Enum.map(fn x -> x * x end)
+|> Enum.filter(fn x -> x > 4 end)     # [9, 16]
+
+case Map.fetch(scores, :alice) do
+  {:ok, value} -> value
+  :error       -> :fallback
 end
 
-def greet(name)
-  return "hi, " + name
-end
+for x <- [1, 2, 3], x > 1, do: x * x  # [4, 9]
 ```
 
-### Pattern matching
+Values: integers/floats, atoms (`:ok`, and `true`/`false`/`nil`), strings with
+`"#{interpolation}"`, lists `[h | t]`, tuples `{:ok, v}`, maps `%{a: 1}`
+(accessed `m.a`), structs `%Point{x: 1}` (`defstruct [:x, :y]`), and functions
+`fn x -> x end` (called `f.(x)`, captured `&Mod.fun/2`, shorthand `&(&1 + 1)`).
 
-`match` dispatches on a value by type, literal, or binding:
+Standard library — data-first so everything pipes: `Enum` (map, filter, reject,
+reduce, find, count, any?, all?, sum, join, sort, sort_by, member?), `String`,
+`Map`, `List`, `Integer`, `Kernel` (auto-imported: `div`, `hd`, `elem`, `is_*`
+guards, …), `IO` (puts, inspect).
 
-```ruby
-match reply
-when "yes"        # literal
-  puts "affirmative"
-when Number       # type: Nil Bool Number String Array Hash Agent Message ...
-  puts "a number"
-when other        # a bare name binds the value
-  puts "got: " + str(other)
-end
-```
+**Extensions beyond Elixir-lite:** a trailing `*rest` variadic parameter
+(`def log(level, *rest)`), and the process model below. Not (yet) present:
+sigils, `alias`/`import`, map/struct update (`%{m | k: v}`), bracket access
+(`m[:k]` — use `m.k` or `Map.get`).
 
-### Anonymous functions
+---
 
-`def (params) ... end` is a value — used for hooks, commands, tools, edges:
+## Core: building agent systems
 
-```ruby
-double = def (x) return x * 2 end
-puts double(21)   # 42
-```
+This is the new part. Agentic primitives and OTP constructs are all **structs +
+modules of functions**, so you compose them the same way you compose any data —
+with pattern matching and the pipe.
 
-## Primitives
+### Agentic primitives
 
-Primitives are **classes**. Build one with `.new` and Ruby-style keyword args,
-keep the result, and invoke it later with a method. `.new` takes a config
-(`Agent.new(model: "…", system: "…")`); omit it for defaults (`Memory.new`).
-
-| Primitive  | Constructor | Invoke with |
-|------------|-------------|-------------|
-| `Model`    | `Model.new(provider:, name:, temperature:)` | (data — passed to an agent) |
-| `Charter`  | `Charter.new(rules:, hooks:, skills:, commands:)` | (definition — intaken by a harness) |
-| `Harness`  | `Harness.new(charter:, graph:)` | `.invoke` `.trigger` `.command` `.skill` (graph-backed) |
-| `Agent`    | `Agent.new(model:, system:, harness:, tools:, memory:)` | `.run` `.ask` `.invoke` `.use` `.delegate` `.fan_out` |
-| `Subagent` | `Subagent.new(name:, description:, model:, system:, tools:)` | `.run` · `.delegate` target |
-| `Tool`     | `Tool.new(name:, description:, run:)` | model calls it during a run; `.run` directly |
-| `Memory`   | `Memory.new` | `.remember(k,v)` `.recall(k)` `.forget` `.keys` |
-| `Rule`     | `Rule.new(name:, text:)` | (data — folded into a charter) |
-| `Skill`    | `Skill.new(name:, description:, instructions:)` | `.use` on an agent |
-| `Hook`     | `Hook.new(on:, do:)` | (data — folded into a charter/agent) |
-| `Command`  | `Command.new(name:, run:)` | `.run` `.call` `.invoke` |
-| `Graph`    | `Graph.new(entry:, nodes:, edges:)` | `.invoke` `.trigger` `.run` |
-| `Factory`  | `Factory.new(agent:, tasks:)` | `.push` `.run` `.size` |
-
-The composition is **`Charter → Harness → Agent`**: a charter bundles governance,
-a harness intakes a charter (and may carry a graph), and an **agent is a harness
-plus a model**. Agents delegate to **subagents** (the Claude Code "agent"
-primitive), call **tools**, and read/write **memory**.
-
-### Model
-
-Names a provider + model. Only `openai` is implemented today; the primitive
-exists so other providers can be added without touching agent code. An agent's
-`model:` accepts a model primitive or a bare string (openai shorthand).
-
-```ruby
-fast = Model.new(provider: "openai", name: "gpt-4o-mini", temperature: 0.2)
-bot  = Agent.new(model: fast, system: "...")
-```
-
-### Agent (= harness + model)
-
-```ruby
-bot = Agent.new(
-  name: "bot",
-  model: "gpt-4o-mini",
-  system: "You are helpful.",
-  harness: gov,             # governance: rules/hooks/skills from its charter
-  tools: [calculator],      # callables the model may invoke
-  memory: notes,            # persistent store (remember/recall)
-  subagents: [translator]   # delegates, reachable via .delegate
+```elixir
+weather = Tool.new(
+  name: "get_weather",
+  description: "Get the current weather for a city",
+  run: fn city -> "sunny, 25C in #{city}" end
 )
 
-bot.invoke("...")                   # -> Message  (alias: .run / .ask)
-bot.use(summarize, "...")           # run with a skill's instructions prepended
-bot.delegate("translator", "...")   # hand off to a named subagent
-bot.fan_out(["a", "b"])             # run over many inputs concurrently -> [Message]
-```
-
-Rules, hooks, and skills may also be passed inline (`rules:`, `hooks:`, `skills:`).
-
-### Subagent
-
-A named, described worker an agent delegates to.
-
-```ruby
-translator = Subagent.new(
-  name: "translator",
-  description: "Use to translate text into French",
-  model: "gpt-4o-mini",
-  system: "Translate to French. Output only the translation.",
-  tools: [dictionary]
-)
-```
-
-### Tool
-
-A callable the model may invoke mid-run via OpenAI function calling. `run:` takes
-the tool's string input. Attach with `tools:` on an agent or subagent; the run
-loops until the model produces a final answer.
-
-```ruby
-shout = Tool.new(
-  name: "shout",
-  description: "Convert text to UPPERCASE. Use when asked to shout.",
-  run: def (text) return text.upcase end
+agent = Agent.new(
+  model: Model.new(name: "gpt-4o-mini", temperature: 0.2),
+  system: "Use the get_weather tool. Be terse.",
+  tools: [weather]
 )
 
-crier = Agent.new(tools: [shout])
-crier.run("Please shout: hello")   # model calls shout -> HELLO
-shout.run("direct")                # tools are callable directly -> DIRECT
+{:ok, msg} = "Weather in Paris?" |> Agent.run(agent)   # model calls the tool, then answers
 ```
 
-### Memory
+- **`Agent`** — `Agent.new(model:, system:, tools:)`. `Agent.run(input, agent)`
+  returns `{:ok, %Message{}}` / `{:error, reason}` and drives the tool-calling
+  loop; `Agent.run!/2` returns the bare message or raises; `Agent.fan_out(inputs,
+  agent)` runs many inputs concurrently.
+- **`Tool`** — `Tool.new(name:, description:, run:)`; the model invokes `run:`
+  (given the tool's string input) mid-run via function calling.
+- **`Model`** — `Model.new(provider:, name:, temperature:)`. Only `openai` is
+  wired today; the struct exists so other providers slot in later.
+- **`Message`** — an agent's output: `.content`, `.role`, `.from`.
+- **`Harness`** — `%Harness{run: fn input -> {:ok, out} end}`; wraps a whole
+  pipeline into one overridable, runnable unit.
 
-A persistent key/value store. Attach with `memory:` and the model gets built-in
-`remember` and `recall` tools; `recall` fuzzily matches when a later turn phrases
-a key differently.
+### Orchestration & OTP-lite
 
-```ruby
-notes = Memory.new
-bot = Agent.new(memory: notes, system: "Remember facts; recall before answering.")
-bot.run("My favorite color is teal.")
-bot.run("What is my favorite color?")   # -> teal
-notes.recall("favorite_color")          # read it directly
-```
+The thing that *decides what runs* is an orchestrator or supervisor, not an
+agent. Agents are leaf workers; sequencing, fan-out, routing, and restart are
+ordinary Allegro modules over the process model.
 
-### Charter + Harness
+- **`Orchestrator`** — `sequence(input, stages)` threads input through stages
+  (short-circuits on `{:error, _}`); `parallel(input, stages)` fans each stage
+  out to its own process and gathers results in order.
+- **`Factory`** — a fixed pool of worker processes draining a job queue.
+- **`Supervisor`** — runs child specs `{id, start}` as monitored processes,
+  restarting on crash (`:one_for_one`, up to `max_restarts`).
+- **`Retry`** — retry a fallible `{:ok,_}`/`{:error,_}` function with backoff.
+- **`Loop`** — an agentic run-until-done loop.
+- **`StateGraph`** — a graph of nodes over a shared state map (per-key reducers,
+  conditional routing) with checkpointing and `resume` from any checkpoint.
 
-A **Charter** bundles rules, hooks, skills, and commands. A **Harness** intakes a
-charter (and may carry a graph). A harness + a model is an agent; a harness with a
-graph runs on its own.
+### Putting it together — a support system
 
-```ruby
-governance = Charter.new(rules: [concise], hooks: [redact], commands: [brief])
-gov = Harness.new(charter: governance)
-gov.command("brief").run("the sea")            # reach into the charter
+Agents as pipeline stages, wrapped in a `Harness`, made resilient with `Retry`,
+metered with a `Store`, driven by a `for` comprehension over a batch. This is
+`examples/support_system.al`, and it runs end to end against OpenAI:
 
-assistant = Agent.new(harness: gov)
-assistant.invoke("What is Rust good at?")      # rules + hooks applied
+```elixir
+triage    = Agent.new(system: "Classify the ticket in one word: billing, tech, or other.")
+responder = Agent.new(system: "You are a terse support agent. One sentence.")
 
-router = Harness.new(graph: flow)
-router.trigger("some input")                   # graph-backed harness
-```
+# a two-stage pipeline wrapped as one runnable unit
+desk = %Harness{run: fn ticket ->
+  Orchestrator.sequence(ticket, [
+    fn t ->
+      case Agent.run(t, triage) do
+        {:ok, m} -> {:ok, "[#{String.trim(m.content)}] #{t}"}
+        err -> err
+      end
+    end,
+    fn tagged ->
+      case Retry.run(fn -> Agent.run(tagged, responder) end, 3) do   # resilient stage
+        {:ok, m} -> {:ok, m.content}
+        err -> err
+      end
+    end
+  ])
+end}
 
-### Graph
+handled = Store.new(0)
 
-Control-flow routing. Nodes are agents, functions, or subgraphs; each node's
-output feeds the next. An edge is a target node name or a router function that
-returns the next name; `"end"` (or `nil`) stops.
-
-```ruby
-flow = Graph.new(
-  entry: "classify",
-  nodes: { classify: classifier, answer: responder },
-  edges: {
-    classify: def (msg) if msg.content.contains?("MATH") return "answer" end return "end" end,
-    answer:   "end"
-  }
-)
-flow.trigger("What is 2+2?")
-```
-
-### Factory (agent runner queue)
-
-A worker agent plus a FIFO queue of tasks. Push tasks and drain them through the
-worker, one result per task.
-
-```ruby
-runner = Factory.new(agent: worker, tasks: ["a", "b"])
-runner.push("c")
-runner.size            # 3
-for r in runner.run    # drains the queue -> [Message]
-  puts r.content
+for ticket <- ["My card was charged twice", "The app crashes on login"] do
+  {:ok, answer} = Harness.run(ticket, desk)
+  Store.update(handled, fn n -> n + 1 end)
+  IO.puts("- #{answer}")
 end
-runner.run(["d", "e"]) # enqueue inline, then drain
+IO.puts("handled #{Store.get(handled)} tickets")
 ```
 
-## Custom workflows: classes, inheritance & composition
-
-Primitives are classes, so higher-level abstractions are ordinary allegro
-classes built on top of them — no new syntax per pattern. A class **subclasses**
-a primitive (single inheritance), supplies a `config` (the base primitive's
-construction hash), adds methods, and keeps state in `@ivars`. `Name.new` builds
-it; `init` runs on construction; `self.base` reaches the underlying primitive;
-undefined methods delegate to it.
-
-```ruby
-class Desk < Agent
-  def config          # omit model: to inherit the MODEL env default
-    return { system: "...", subagents: [translator], memory: notes }
-  end
-
-  def init            # runs on .new
-    @handled = 0
-  end
-
-  def handle(text)    # domain method wrapping the inherited .invoke
-    @handled = @handled + 1
-    return self.invoke(text)
-  end
-end
-
-desk = Desk.new
-desk.handle("hello")
-
-class TerseDesk < Desk               # class-to-class inheritance
-  def handle(text)
-    return self.invoke("In three words: " + text)
-  end
-end
+```
+- Please check your transaction history and contact customer support for a refund.
+- Try reinstalling the app or clearing its cache.
+handled 2 tickets
 ```
 
-### Composition: modules & delegation
+**Other shapes that compose the same way:**
 
-Single inheritance picks one parent; **composition** covers the rest, Ruby-style.
+- **Supervised agent workers** — make each `Agent.run` a supervised child so
+  transient network/rate-limit failures are restarted automatically
+  (`Supervisor` + a `Store` counter that survives restarts →
+  `examples/self_healing.al`).
+- **Concurrent batch** — `Factory.run(tickets, fn t -> handle(t) end, pool_size)`
+  drains a queue of work across a worker pool (`examples/worker_pool.al`).
+- **Routing between agents** — a `StateGraph` whose nodes are agents and whose
+  edges route on state, with every step checkpointed and resumable
+  (`examples/state_graph.al`).
 
-A **module** is a bag of methods with no state of its own. `include` mixes it
-into a class, where its methods run against the including instance's `@ivars`.
-Method resolution is: the class's own methods, then included modules (last
-`include` wins), then the parent chain.
+---
 
-```ruby
-module Retryable
-  def run_safe(text)
-    return self.invoke(text)   # operates on the including instance
+## Processes (the substrate)
+
+The OTP constructs above are built on a cooperative, single-threaded,
+run-to-completion **actor** scheduler. A process is `state + a handler`; `spawn`
+starts one, `send` delivers a message, the handler runs to completion and
+returns the new state. Handlers never block; only the top-level flow may
+`receive`. Message isolation is free — values are immutable.
+
+```elixir
+defmodule Counter do
+  def handle(n, {:inc, from}) do
+    send(from, {:count, n + 1})
+    {:noreply, n + 1}
   end
 end
 
-class Desk < Agent
-  include Retryable
+pid = spawn(Counter, 0)
+send(pid, {:inc, self()})
+receive do
+  {:count, c} -> IO.puts("count is #{c}")
 end
-
-Desk.new.run_safe("hello")
 ```
 
-**Delegation** forwards named methods to a primitive held in an `@ivar` —
-has-a composition without hand-written wrappers. `forward :method, to: @ivar`
-sends `method` (and its args) to whatever that ivar holds.
+Primitives: `spawn/1,2`, `send/2`, `self/0`, `monitor/1` (delivers
+`{:DOWN, pid, reason}` on death), `receive`/`after`. A **`Store`**
+(`new`/`get`/`put`/`update`) is a mutable cell for state that must outlive a
+call or survive a restart; the **registry** (`Process.register/2`,
+`Process.whereis/1`, `send(:name, msg)`) binds names to pids.
 
-```ruby
-class Desk < Agent
-  forward :remember, :recall, to: @notes   # delegate to the memory it owns
+Single-threaded by design: this provides the message-passing *programming model*
+(mailboxes, queues, supervised workers), not true parallelism or multi-node
+distribution.
 
-  def config
-    return { system: "..." }
-  end
-
-  def init
-    @notes = Memory.new
-  end
-end
-
-d = Desk.new
-d.remember("color", "teal")   # -> @notes.remember(...)
-d.recall("color")             # -> teal
-```
-
-## Core data types
-
-Primitives produce structured values, not bare strings:
-
-- **`Message`** — an agent's output. `.content` / `.text`, `.role`, `.from`, `.length`.
-  Prints as its content, so `puts msg` shows the text.
-- **`HookResult`** — a hook's result: `.value`, `.halt?`. Built with `halt(v)` (stop) or
-  `keep(v)` (continue).
-
-## Built-in functions
-
-`puts` · `print` · `str` · `num` · `len` · `range(n)` / `range(a, b)` · `type_of(x)` ·
-`fan_out(agent, list)` · `pipeline(input, agent, agent, …)` · `halt(v)` · `keep(v)` ·
-`message(content, from)`
-
-`env` is a hash of environment variables: `env.MODEL`, `env["OPENAI_API_KEY"]`.
-
-## Methods by type
-
-- **string**: `upcase` `downcase` `strip` `length` `split(sep)` `contains?(s)` `to_s`
-- **array**: `length` `first` `last` `push(x)` `reverse` `join(sep)` `get(i)`
-- **hash**: `keys` `values` `get(k)` `set(k, v)` `has?(k)` · `h.KEY` reads a key
-- **number**: `round` `floor` `ceil` `to_s`
+---
 
 ## Examples
 
-- `examples/agents.al` — a worker class run through a Factory queue + fan-out
-- `examples/harness.al` — Charter → Harness → Agent, hooks, graph, pattern matching
-- `examples/workflow.al` — a Desk agent with a subagent, a tool, memory, and inheritance
+Every file under `examples/` is standalone and runnable.
+
+| File | Shows |
+|---|---|
+| `support_system.al` | **full system** — agents + Orchestrator + Harness + Retry + Store |
+| `agent.al` | Model / Tool / Agent / Harness against OpenAI |
+| `worker_pool.al` | `Orchestrator.parallel` fan-out, `Factory` worker pool |
+| `supervisor.al` | monitored children, restart on crash |
+| `self_healing.al` | a flaky supervised child that recovers across restarts |
+| `state_graph.al` | `StateGraph` — reducers, routing, checkpoints, resume |
+| `state.al` | `Store` + the process registry |
+| `processes.al` | spawn / send / receive, monitor, `after` |
+| `comprehensions.al` | `for` — generators, filters, cartesian, map iteration |
+
+## Status
+
+Interpreted (tree-walking); no VM or compiler yet. Implemented: the functional
+core, control flow, structs, the data standard library, `for` comprehensions,
+the actor process model (`spawn`/`send`/`receive`/`monitor`, `Store`, registry),
+OTP-lite (`Supervisor`/`Orchestrator`/`Factory`/`Retry`/`Loop`), `StateGraph`
+with checkpointing, and the OpenAI-backed AI primitives.
+
+See `PLAN.md` for the full design, locked decisions, and roadmap. Deferred:
+sigils, `alias`/`import`, map/struct update, `Memory`, `for`
+`into:`/`uniq:`/`reduce:`.

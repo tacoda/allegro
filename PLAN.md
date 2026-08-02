@@ -430,7 +430,11 @@ basics → 25 full multi-agent composition).
   (non-matching generator element is dropped), `do:`/`do…end`; yields a list,
   bindings scoped to the comprehension. See `examples/comprehensions.al`.
   Deferred: `into:`, `uniq:`, `reduce:`.
-- Remaining: sigils (optional), README, and the rest of the tutorial set.
+- ✅ `README.md` — language kept light (Elixir-flavored); the core is agentic +
+  OTP composition, centered on a runnable full-scale example
+  (`examples/support_system.al`: agents as Orchestrator stages, wrapped in a
+  Harness, made resilient with Retry, metered with a Store, driven by `for`).
+- Remaining: sigils (optional), and the rest of the tutorial set.
 
 **Deferred (undecided):** static types (D6). Decoration (D8) cancelled.
 
