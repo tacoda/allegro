@@ -1,1 +1,6 @@
-/target
+node_modules/
+allegro
+*.log
+.DS_Store
+dist/
+*.bun-build

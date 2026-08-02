@@ -1,0 +1,30 @@
+{
+  "name": "allegro",
+  "version": "0.1.0",
+  "description": "A Bun/TypeScript toolkit for agentic systems on an OTP-style process runtime.",
+  "type": "module",
+  "module": "src/index.ts",
+  "bin": {
+    "allegro": "src/cli/main.ts"
+  },
+  "scripts": {
+    "start": "bun run src/cli/main.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build --compile src/cli/main.ts --outfile allegro"
+  },
+  "dependencies": {
+    "ink": "^7.1.1",
+    "openai": "^7.3.0",
+    "react": "^19.2.8",
+    "react-devtools-core": "^7.0.1",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "ink-testing-library": "^4.0.0",
+    "typescript": "^7.0.2"
+  }
+}
