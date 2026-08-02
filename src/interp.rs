@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::ast::{BinOp, Def, Expr, Pattern, StrPart, TopItem, UnOp};
+use crate::ast::{BinOp, CaseClause, Def, Expr, Pattern, StrPart, TopItem, UnOp};
 use crate::parser::expr_to_pattern;
 use crate::value::{new_env, values_equal, Env, Fun, Value};
 
@@ -89,6 +89,11 @@ impl Interp {
                 clauses: clauses.clone(),
                 closure: env.clone(),
             }))),
+            Expr::AnonCall(f, args) => self.eval_anon_call(f, args, env),
+            Expr::CaptureSlot(n) => env
+                .borrow()
+                .get(&format!("$c{}", n))
+                .ok_or_else(|| format!("capture slot &{} is unbound", n)),
             Expr::If(cond, then, els) => {
                 if self.eval(cond, env)?.truthy() {
                     self.eval_block(then, env)
@@ -98,7 +103,95 @@ impl Interp {
                     Ok(Value::Nil)
                 }
             }
+            Expr::Case(subject, clauses) => {
+                let v = self.eval(subject, env)?;
+                self.eval_case(&v, clauses, env)
+            }
+            Expr::Cond(clauses) => self.eval_cond(clauses, env),
+            Expr::With(clauses, body, els) => self.eval_with(clauses, body, els, env),
+            Expr::Pin(_) => Err("^pin is only valid inside a pattern".into()),
         }
+    }
+
+    fn eval_anon_call(&mut self, f: &Expr, args: &[Expr], env: &Env) -> Result<Value, String> {
+        let callee = self.eval(f, env)?;
+        let argv = self.eval_args(args, env)?;
+        match callee {
+            Value::Fun(fun) => self.call_fun(&fun, argv),
+            other => Err(format!("cannot call a {}", other.type_name())),
+        }
+    }
+
+    // A guard passes when absent, or when it evaluates truthy.
+    fn guard_ok(&mut self, guard: &Option<Expr>, env: &Env) -> Result<bool, String> {
+        match guard {
+            Some(g) => Ok(self.eval(g, env)?.truthy()),
+            None => Ok(true),
+        }
+    }
+
+    fn call_fun(&mut self, fun: &Rc<Fun>, args: Vec<Value>) -> Result<Value, String> {
+        for clause in &fun.clauses {
+            if clause.params.len() != args.len() {
+                continue;
+            }
+            let call_env = new_env(Some(fun.closure.clone()));
+            if !self.match_seq(&clause.params, &args, &call_env)? {
+                continue;
+            }
+            if self.guard_ok(&clause.guard, &call_env)? {
+                return self.eval_block(&clause.body, &call_env);
+            }
+        }
+        Err("no function clause matching the given arguments".into())
+    }
+
+    fn eval_case(
+        &mut self,
+        v: &Value,
+        clauses: &[CaseClause],
+        env: &Env,
+    ) -> Result<Value, String> {
+        for clause in clauses {
+            let arm_env = new_env(Some(env.clone()));
+            if !self.match_pattern(&clause.pat, v, &arm_env)? {
+                continue;
+            }
+            if self.guard_ok(&clause.guard, &arm_env)? {
+                return self.eval_block(&clause.body, &arm_env);
+            }
+        }
+        Err(format!("no case clause matching: {}", v.inspect()))
+    }
+
+    fn eval_cond(&mut self, clauses: &[(Expr, Vec<Expr>)], env: &Env) -> Result<Value, String> {
+        for (cond, body) in clauses {
+            if self.eval(cond, env)?.truthy() {
+                return self.eval_block(body, env);
+            }
+        }
+        Err("no cond clause was truthy".into())
+    }
+
+    fn eval_with(
+        &mut self,
+        clauses: &[(Pattern, Expr)],
+        body: &[Expr],
+        els: &Option<Vec<CaseClause>>,
+        env: &Env,
+    ) -> Result<Value, String> {
+        let with_env = new_env(Some(env.clone()));
+        for (pat, src) in clauses {
+            let v = self.eval(src, &with_env)?;
+            if !self.match_pattern(pat, &v, &with_env)? {
+                // a non-match short-circuits: run `else`, or return the value
+                return match els {
+                    Some(arms) => self.eval_case(&v, arms, env),
+                    None => Ok(v),
+                };
+            }
+        }
+        self.eval_block(body, &with_env)
     }
 
     fn eval_block(&mut self, stmts: &[Expr], env: &Env) -> Result<Value, String> {
@@ -266,25 +359,15 @@ impl Interp {
             .unwrap_or_default();
         for def in &clauses {
             let call_env = new_env(Some(self.global.clone()));
-            let mut matched = true;
-            for (pat, arg) in def.params.iter().zip(args.iter()) {
-                if !self.match_pattern(pat, arg, &call_env)? {
-                    matched = false;
-                    break;
-                }
-            }
-            if !matched {
+            if !self.match_seq(&def.params, &args, &call_env)? {
                 continue;
             }
-            if let Some(g) = &def.guard {
-                if !self.eval(g, &call_env)?.truthy() {
-                    continue;
-                }
+            if self.guard_ok(&def.guard, &call_env)? {
+                self.current.push(module.to_string());
+                let result = self.eval_block(&def.body, &call_env);
+                self.current.pop();
+                return result;
             }
-            self.current.push(module.to_string());
-            let result = self.eval_block(&def.body, &call_env);
-            self.current.pop();
-            return result;
         }
         Err(format!(
             "no function clause matching {}.{}/{}",
@@ -307,6 +390,13 @@ impl Interp {
             Pattern::List(pats) => self.match_list(pats, val, env),
             Pattern::Cons(h, t) => self.match_cons(h, t, val, env),
             Pattern::Map(pairs) => self.match_map(pairs, val, env),
+            Pattern::Pin(name) => {
+                let pinned = env
+                    .borrow()
+                    .get(name)
+                    .ok_or_else(|| format!("^{} is unbound", name))?;
+                Ok(values_equal(&pinned, val))
+            }
             scalar => Ok(match_scalar(scalar, val)),
         }
     }
@@ -470,9 +560,18 @@ fn io_call(fun: &str, args: Vec<Value>) -> Result<Value, String> {
             println!();
             Ok(Value::Atom("ok".into()))
         }
+        // inspect/debug print and return their input, so they drop into a pipe.
         ("inspect", [v]) => {
             println!("{}", v.inspect());
             Ok(v.clone())
+        }
+        ("debug", [v]) => {
+            eprintln!("[debug] {}", v.inspect());
+            Ok(v.clone())
+        }
+        ("write", [v]) => {
+            print!("{}", v);
+            Ok(Value::Atom("ok".into()))
         }
         _ => Err(format!("IO.{}/{} is undefined", fun, args.len())),
     }

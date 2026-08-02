@@ -40,7 +40,10 @@ pub enum Tok {
     Dot,
     Bar,      // |  (cons / map update)
     Arrow,    // ->
+    LArrow,   // <-
     FatArrow, // =>
+    Amp,      // &  (capture)
+    Caret,    // ^  (pin)
     Colon,   // :
     // operators
     Match,   // =

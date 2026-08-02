@@ -14,8 +14,11 @@ selected by **pattern matching**.
   interpreter**. The binary reads a `.al` file and evaluates its AST directly.
 - **No compilation yet.** Interpreted is the target for now; a compiler is a
   later, separate effort.
-- No processes/actors/OTP, no concurrency model, no distribution. (`fan_out`
+- No BEAM processes/actors, no concurrency model, no distribution. (`fan_out`
   stays a thread-pool helper as today, not a process model.)
+- **OTP-lite is in scope**: cooperative supervision + self-healing (restart
+  failed children per a strategy) built on error-catching, *not* on processes.
+  See §4.4.
 - No macros/metaprogramming in phase 1 (`defmacro`), no protocols/behaviours in
   phase 1.
 
@@ -174,13 +177,10 @@ def handle({:error, reason}), do: log(reason)
 def handle(_other), do: :ignored          # catch-all safeguard
 ```
 
-Wrapping/decorating a primitive is expressed the same way: match the shapes you
-specialize and delegate the rest to the inner primitive through the catch-all —
-no type system or protocol needed. **Variadic functions (`*rest`, D5)** pair
-with this: collect varying arguments and dispatch on their shape.
-
-A protocol/behaviour mechanism for polymorphic decoration is **on hold** (D8) —
-convention-based multi-clause dispatch is the current answer.
+Wrapping a primitive is expressed the same way: match the shapes you specialize
+and delegate the rest to the inner primitive through the catch-all — no type
+system needed. **Variadic functions (`*rest`, D5)** pair with this: collect
+varying arguments and dispatch on their shape.
 
 ## 3ter. Memory management
 
@@ -231,6 +231,40 @@ IO.puts(msg.content)
 Modules (each with `new/1` + operations): `Model`, `Agent`, `Subagent`, `Tool`,
 `Memory`, `Rule`, `Skill`, `Hook`, `Command`, `Charter`, `Harness`, `Graph`,
 `Factory`. `Agent.new/1` reuses today's `build_agent` assembly logic.
+
+### 4.4 Supervision (OTP-lite, no processes)
+
+Supervisors + **self-healing** without BEAM processes: cooperative and built on
+the error channel (a `raise`/crash carries a value; the supervisor catches it).
+
+- A **child spec** is a callable (an `fn`, an agent runner, a `{mod, fun, args}`
+  triple) plus a `:restart` policy (`:permanent | :transient | :temporary`).
+- `Supervisor.start(children, strategy: :one_for_one, max_restarts: 3)` runs the
+  children; when one crashes, the supervisor restarts it per the strategy
+  (`:one_for_one` restarts just that child; `:one_for_all` restarts all) until
+  `max_restarts` is exceeded, then it gives up and surfaces `{:error, _}`.
+- Self-healing agent example: wrap a flaky `Agent.run` as a supervised child so
+  transient failures (network, rate limits) are retried automatically.
+- Scope: single-threaded and synchronous — supervision = structured retry/
+  restart with strategies, not live concurrent processes. `GenServer`/mailboxes
+  are out of scope.
+
+### 4.5 Orchestration (agents are workers, not orchestrators)
+
+Composition is driven by **orchestration/supervision constructs, not by an
+agent delegating to sub-agents.** An `Agent` is a leaf worker: given input, it
+produces output. Sequencing, routing, fan-out, and retry are the job of:
+
+- `Graph` — control-flow routing between agent nodes (already exists).
+- `Orchestrator` — composes agents into a pipeline/plan and runs them
+  (sequential, parallel/`fan_out`, conditional) — the top-level driver.
+- `Supervisor` — runs composed agents with restart strategies (§4.4).
+
+This replaces the old agent-as-orchestrator model (a top-level agent holding
+`subagents` and calling `delegate`). Sub-agents may remain as *named workers*,
+but the thing that *decides what runs* is an orchestrator/supervisor, not an
+agent. Keeps composition functional and inspectable rather than hidden inside a
+model's tool-calls.
 
 **Decision D1 (flagged) — pipeline subject convention.** In a functional agent
 pipeline the thing that flows is the **message/data**, so recommend
@@ -328,12 +362,14 @@ arithmetic (`/` vs div/rem), comparison, `<>`/`++`/`--`, boolean, `if`, pipe.
 *Verify:* `[1,2,3] |> Enum.map(fn x -> x*x end) |> Enum.sum()`; a struct
 round-trip; convention-based delegate/decorate via multi-clause + `_`.
 
-**Phase 4 — AI primitives as std lib.**
+**Phase 4 — AI primitives + supervision.**
 Structs + modules for all primitives (`Allegro.*`, default-aliased), wired to
 `openai.rs`; env-default inline config; `{:ok,_}`/`{:error,_}` + bang variants;
 pipe composition; tool loop; memory; graph routing; delegation; fan_out.
-Decoration by convention (multi-clause dispatch + delegation), no protocol.
-*Verify:* rebuilt equivalents of today's examples run against OpenAI.
+Plus `raise`/`rescue` (error channel) and `Supervisor` (OTP-lite, §4.4) for
+self-healing agents.
+*Verify:* rebuilt examples run against OpenAI; a flaky supervised child is
+restarted and recovers.
 
 **Phase 5 — Ergonomics, docs & tutorial.**
 `for` comprehensions, sigils (optional), `README.md`, and **a 25-file tutorial**
@@ -341,7 +377,7 @@ in `examples/` of growing complexity — each a standalone, runnable `.al` (01
 basics → 25 full multi-agent composition).
 *Verify:* every one of the 25 examples runs.
 
-**Deferred (undecided):** static types (D6) and a decoration protocol (D8).
+**Deferred (undecided):** static types (D6). Decoration (D8) cancelled.
 
 ## 8. Decisions (LOCKED)
 
@@ -364,9 +400,8 @@ basics → 25 full multi-agent composition).
   matching + `_` catch-all, not a type system.
 - **D7 nil KEPT.** Elixir-consistent. Option = `t | nil`; Result =
   `{:ok, t} | {:error, e}` (Rust semantics, Elixir clothing).
-- **D8 Decoration — ON HOLD (undecided).** No protocol for now; decorate by
-  convention (multi-clause dispatch + delegation via the catch-all). Revisit a
-  protocol/behaviour later if convention proves insufficient.
+- **D8 Decoration — CANCELLED.** No protocol/behaviour, no decoration feature.
+  Wrapping/delegation, when needed, is just ordinary multi-clause dispatch.
 
 ## 9. Risks
 

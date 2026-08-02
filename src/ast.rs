@@ -52,8 +52,22 @@ pub enum Expr {
     RemoteCall(String, String, Vec<Expr>), // Mod.fun(args)
     Field(Box<Expr>, String),              // value.field
     ModuleRef(String),                     // a bare module alias
-    Fn(Vec<FnClause>),                     // fn ... end (phase 2 eval)
+    Fn(Vec<FnClause>),                     // fn ... end
+    AnonCall(Box<Expr>, Vec<Expr>),        // f.(args)
+    CaptureSlot(usize),                    // &1, &2, ... inside a capture
     If(Box<Expr>, Vec<Expr>, Option<Vec<Expr>>),
+    Case(Box<Expr>, Vec<CaseClause>),
+    Cond(Vec<(Expr, Vec<Expr>)>),          // condition -> body
+    With(Vec<(Pattern, Expr)>, Vec<Expr>, Option<Vec<CaseClause>>), // clauses, body, else
+    Pin(String),                           // ^var, only in pattern position
+}
+
+// A `pattern [when guard] -> body` clause (case / with-else).
+#[derive(Debug, Clone)]
+pub struct CaseClause {
+    pub pat: Pattern,
+    pub guard: Option<Expr>,
+    pub body: Vec<Expr>,
 }
 
 // A clause of an anonymous function (or, later, a multi-clause def).
@@ -78,6 +92,7 @@ pub enum Pattern {
     List(Vec<Pattern>),
     Cons(Box<Pattern>, Box<Pattern>),
     Map(Vec<(Expr, Pattern)>), // key expression (evaluated) -> sub-pattern
+    Pin(String),               // ^var — match against the variable's value
 }
 
 #[derive(Debug, Clone)]

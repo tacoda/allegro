@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, Def, Expr, FnClause, Pattern, StrPart, TopItem, UnOp};
+use crate::ast::{BinOp, CaseClause, Def, Expr, FnClause, Pattern, StrPart, TopItem, UnOp};
 use crate::token::Tok;
 
 pub fn parse(toks: Vec<Tok>) -> Result<Vec<TopItem>, String> {
@@ -310,14 +310,25 @@ impl Parser {
 
     fn postfix(&mut self) -> Result<Expr, String> {
         let mut e = self.primary()?;
-        // Field access on a value: `value.field` (lowercase field).
-        while self.check(&Tok::Dot) && matches!(self.peek_at(1), Tok::Ident(_)) {
-            self.advance(); // .
-            let field = self.ident_name()?;
-            if self.check(&Tok::LParen) {
-                return Err("calling a method on a value is not supported; use Module.fun(value)".into());
+        loop {
+            if !self.check(&Tok::Dot) {
+                break;
             }
-            e = Expr::Field(Box::new(e), field);
+            match self.peek_at(1) {
+                // anonymous-function call: `f.(args)`
+                Tok::LParen => {
+                    self.advance(); // .
+                    let args = self.arg_list()?;
+                    e = Expr::AnonCall(Box::new(e), args);
+                }
+                // field access: `value.field`
+                Tok::Ident(_) => {
+                    self.advance(); // .
+                    let field = self.ident_name()?;
+                    e = Expr::Field(Box::new(e), field);
+                }
+                _ => break,
+            }
         }
         Ok(e)
     }
@@ -375,6 +386,15 @@ impl Parser {
             Tok::MapOpen => self.map_literal(),
             Tok::Fn => self.fn_literal(),
             Tok::If => self.if_expr(),
+            Tok::Unless => self.unless_expr(),
+            Tok::Case => self.case_expr(),
+            Tok::Cond => self.cond_expr(),
+            Tok::With => self.with_expr(),
+            Tok::Amp => self.capture_expr(),
+            Tok::Caret => {
+                self.advance();
+                Ok(Expr::Pin(self.ident_name()?))
+            }
             other => Err(format!("unexpected token {:?}", other)),
         }
     }
@@ -591,6 +611,197 @@ impl Parser {
         self.eat(&Tok::End)?;
         Ok(Expr::If(Box::new(cond), then, els))
     }
+
+    fn unless_expr(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::Unless)?;
+        let cond = self.expr()?;
+        // `unless c` runs its body when c is falsy: negate and reuse `if`.
+        let neg = Expr::Unary(UnOp::Not, Box::new(cond));
+        if self.check(&Tok::Comma) {
+            self.advance();
+            self.expect_kwkey("do")?;
+            let then = self.expr()?;
+            return Ok(Expr::If(Box::new(neg), vec![then], None));
+        }
+        self.eat(&Tok::Do)?;
+        let then = self.block(&[Tok::Else, Tok::End])?;
+        let els = if self.check(&Tok::Else) {
+            self.advance();
+            Some(self.block(&[Tok::End])?)
+        } else {
+            None
+        };
+        self.eat(&Tok::End)?;
+        Ok(Expr::If(Box::new(neg), then, els))
+    }
+
+    fn case_expr(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::Case)?;
+        let subject = self.expr()?;
+        self.eat(&Tok::Do)?;
+        let clauses = self.case_clauses()?;
+        self.eat(&Tok::End)?;
+        Ok(Expr::Case(Box::new(subject), clauses))
+    }
+
+    // `pattern [when guard] -> body` clauses, up to (not including) `end`.
+    fn case_clauses(&mut self) -> Result<Vec<CaseClause>, String> {
+        let mut clauses = Vec::new();
+        self.skip_newlines();
+        while !self.check(&Tok::End) {
+            let pat = expr_to_pattern(self.expr()?)?;
+            let guard = self.opt_guard()?;
+            self.eat(&Tok::Arrow)?;
+            let body = self.clause_body()?;
+            clauses.push(CaseClause { pat, guard, body });
+            self.skip_newlines();
+        }
+        Ok(clauses)
+    }
+
+    fn cond_expr(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::Cond)?;
+        self.eat(&Tok::Do)?;
+        let mut clauses = Vec::new();
+        self.skip_newlines();
+        while !self.check(&Tok::End) {
+            let cond = self.expr()?;
+            self.eat(&Tok::Arrow)?;
+            let body = self.clause_body()?;
+            clauses.push((cond, body));
+            self.skip_newlines();
+        }
+        self.eat(&Tok::End)?;
+        Ok(Expr::Cond(clauses))
+    }
+
+    fn with_expr(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::With)?;
+        let mut clauses = Vec::new();
+        loop {
+            let pat = expr_to_pattern(self.expr()?)?;
+            self.eat(&Tok::LArrow)?;
+            let src = self.expr()?;
+            clauses.push((pat, src));
+            if self.check(&Tok::Comma) {
+                self.advance();
+                self.skip_newlines();
+            } else {
+                break;
+            }
+        }
+        self.eat(&Tok::Do)?;
+        let body = self.block(&[Tok::Else, Tok::End])?;
+        let els = if self.check(&Tok::Else) {
+            self.advance();
+            Some(self.case_clauses()?)
+        } else {
+            None
+        };
+        self.eat(&Tok::End)?;
+        Ok(Expr::With(clauses, body, els))
+    }
+
+    fn opt_guard(&mut self) -> Result<Option<Expr>, String> {
+        if self.check(&Tok::When) {
+            self.advance();
+            Ok(Some(self.expr()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // A clause body runs until `end` or the start of the next `... ->` clause.
+    fn clause_body(&mut self) -> Result<Vec<Expr>, String> {
+        let mut body = Vec::new();
+        self.skip_newlines();
+        while !self.check(&Tok::End) && !self.starts_new_clause() {
+            body.push(self.expr()?);
+            self.skip_newlines();
+        }
+        Ok(body)
+    }
+
+    // True if the current line is a clause head — a top-level `->` appears
+    // before the line ends (nested blocks/brackets don't count).
+    fn starts_new_clause(&self) -> bool {
+        let mut i = self.pos;
+        let mut depth = 0i32;
+        loop {
+            match self.toks.get(i).unwrap_or(&Tok::Eof) {
+                Tok::Eof => return false,
+                Tok::Newline if depth == 0 => return false,
+                Tok::Arrow if depth == 0 => return true,
+                Tok::LParen | Tok::LBracket | Tok::LBrace | Tok::MapOpen | Tok::Do | Tok::Fn => {
+                    depth += 1
+                }
+                Tok::RParen | Tok::RBracket | Tok::RBrace | Tok::End => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    // `&fun/arity`, `&Mod.fun/arity`, or `&(expr with &1 &2 ...)`.
+    fn capture_expr(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::Amp)?;
+        // a bare slot `&1` inside a capture body
+        if let Tok::Int(n) = self.peek().clone() {
+            self.advance();
+            return Ok(Expr::CaptureSlot(n as usize));
+        }
+        // function capture: `&name/arity` or `&Mod.fun/arity`
+        if self.is_function_capture() {
+            return self.function_capture();
+        }
+        // expression capture: `&(...)` — wrap in a fn over the slots used
+        let body = self.unary_expr()?;
+        let arity = max_slot(&body);
+        let params = (1..=arity).map(|i| Pattern::Var(slot_name(i))).collect();
+        Ok(Expr::Fn(vec![FnClause {
+            params,
+            guard: None,
+            body: vec![body],
+        }]))
+    }
+
+    fn is_function_capture(&self) -> bool {
+        match self.peek() {
+            Tok::Ident(_) => self.peek_at(1) == &Tok::Slash,
+            Tok::Alias(_) => true,
+            _ => false,
+        }
+    }
+
+    fn function_capture(&mut self) -> Result<Expr, String> {
+        let (path, fun) = if matches!(self.peek(), Tok::Alias(_)) {
+            let path = self.module_path()?;
+            self.eat(&Tok::Dot)?;
+            (Some(path), self.ident_name()?)
+        } else {
+            (None, self.ident_name()?)
+        };
+        self.eat(&Tok::Slash)?;
+        let arity = self.int_lit()?;
+        let args: Vec<Expr> = (1..=arity).map(|i| Expr::Var(slot_name(i))).collect();
+        let call = match path {
+            Some(p) => Expr::RemoteCall(p, fun, args),
+            None => Expr::LocalCall(fun, args),
+        };
+        let params = (1..=arity).map(|i| Pattern::Var(slot_name(i))).collect();
+        Ok(Expr::Fn(vec![FnClause {
+            params,
+            guard: None,
+            body: vec![call],
+        }]))
+    }
+
+    fn int_lit(&mut self) -> Result<usize, String> {
+        match self.advance() {
+            Tok::Int(n) => Ok(n as usize),
+            other => Err(format!("expected an integer, found {:?}", other)),
+        }
+    }
 }
 
 // `left |> f(args)` becomes `f(left, args...)`.
@@ -610,9 +821,36 @@ fn pipe_into(left: Expr, rhs: Expr) -> Result<Expr, String> {
     }
 }
 
+fn slot_name(i: usize) -> String {
+    format!("$c{}", i)
+}
+
+// Highest capture slot `&n` used in an expression — the arity of `&(...)`.
+fn max_slot(e: &Expr) -> usize {
+    match e {
+        Expr::CaptureSlot(n) => *n,
+        Expr::Unary(_, x) => max_slot(x),
+        Expr::Field(x, _) => max_slot(x),
+        Expr::Binary(_, l, r) => max_slot(l).max(max_slot(r)),
+        Expr::Match(l, r) => max_slot(l).max(max_slot(r)),
+        Expr::Cons(h, t) => max_slot(h).max(max_slot(t)),
+        Expr::Tuple(xs) | Expr::List(xs) => xs.iter().map(max_slot).max().unwrap_or(0),
+        Expr::LocalCall(_, xs) => xs.iter().map(max_slot).max().unwrap_or(0),
+        Expr::RemoteCall(_, _, xs) => xs.iter().map(max_slot).max().unwrap_or(0),
+        Expr::AnonCall(f, xs) => max_slot(f).max(xs.iter().map(max_slot).max().unwrap_or(0)),
+        Expr::Map(ps) => ps
+            .iter()
+            .map(|(k, v)| max_slot(k).max(max_slot(v)))
+            .max()
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
 // Convert an expression used in pattern position into a Pattern.
 pub fn expr_to_pattern(e: Expr) -> Result<Pattern, String> {
     Ok(match e {
+        Expr::Pin(name) => Pattern::Pin(name),
         Expr::Var(name) if name == "_" || name.starts_with('_') => {
             if name == "_" {
                 Pattern::Wildcard
