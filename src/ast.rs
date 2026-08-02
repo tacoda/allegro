@@ -1,86 +1,96 @@
+// Abstract syntax for the Elixir-flavored core.
+
 #[derive(Debug, Clone)]
-pub enum Expr {
-    Num(f64),
-    Str(String),
-    Bool(bool),
-    Nil,
-    Ident(String),
-    IVar(String), // @field on the current instance
-    Array(Vec<Expr>),
-    Hash(Vec<(String, Expr)>),
-    Index(Box<Expr>, Box<Expr>),
-    // callee(args)
-    Call(Box<Expr>, Vec<Expr>),
-    // recv.method(args) — args empty means property access
-    Method(Box<Expr>, String, Vec<Expr>),
-    // anonymous function: def (params) ... end
-    Func(Vec<String>, Vec<Stmt>),
-    Unary(UnOp, Box<Expr>),
-    Binary(BinOp, Box<Expr>, Box<Expr>),
-    Assign(Box<Expr>, Box<Expr>),
+pub enum StrPart {
+    Lit(String),
+    Expr(Expr),
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum UnOp {
-    Neg,
-    Not,
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOp {
     Add,
     Sub,
     Mul,
     Div,
-    Mod,
     Eq,
     Neq,
     Lt,
     Gt,
     Le,
     Ge,
+    Concat,     // <>
+    ListConcat, // ++
+    ListDiff,   // --
     And,
     Or,
 }
 
-// A `when` pattern in a `match`.
-#[derive(Debug, Clone)]
-pub enum Pattern {
-    Wildcard,          // _
-    Type(String),      // a type name: String, Number, Message, Agent, ...
-    Bind(String),      // a bare identifier: binds the subject to that name
-    Value(Expr),       // any expression: matches by equality
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnOp {
+    Neg,
+    Not,
 }
 
 #[derive(Debug, Clone)]
-pub enum Stmt {
+pub enum Expr {
+    Int(i64),
+    Float(f64),
+    Atom(String),
+    Bool(bool),
+    Nil,
+    Str(Vec<StrPart>),
+    Var(String),
+    List(Vec<Expr>),
+    Cons(Box<Expr>, Box<Expr>), // [head | tail]
+    Tuple(Vec<Expr>),
+    Map(Vec<(Expr, Expr)>),
+    Block(Vec<Expr>),
+    Match(Box<Expr>, Box<Expr>), // pattern = value
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+    Unary(UnOp, Box<Expr>),
+    LocalCall(String, Vec<Expr>),          // foo(args)
+    RemoteCall(String, String, Vec<Expr>), // Mod.fun(args)
+    Field(Box<Expr>, String),              // value.field
+    ModuleRef(String),                     // a bare module alias
+    Fn(Vec<FnClause>),                     // fn ... end (phase 2 eval)
+    If(Box<Expr>, Vec<Expr>, Option<Vec<Expr>>),
+}
+
+// A clause of an anonymous function (or, later, a multi-clause def).
+#[derive(Debug, Clone)]
+pub struct FnClause {
+    pub params: Vec<Pattern>,
+    pub guard: Option<Expr>,
+    pub body: Vec<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    Wildcard,
+    Var(String),
+    Int(i64),
+    Float(f64),
+    Atom(String),
+    Bool(bool),
+    Nil,
+    Str(String),
+    Tuple(Vec<Pattern>),
+    List(Vec<Pattern>),
+    Cons(Box<Pattern>, Box<Pattern>),
+    Map(Vec<(Expr, Pattern)>), // key expression (evaluated) -> sub-pattern
+}
+
+#[derive(Debug, Clone)]
+pub struct Def {
+    pub name: String,
+    pub params: Vec<Pattern>,
+    pub guard: Option<Expr>,
+    pub body: Vec<Expr>,
+    pub private: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum TopItem {
+    Module { name: String, defs: Vec<Def> },
     Expr(Expr),
-    If {
-        cond: Expr,
-        then: Vec<Stmt>,
-        elifs: Vec<(Expr, Vec<Stmt>)>,
-        els: Option<Vec<Stmt>>,
-    },
-    Match {
-        subject: Expr,
-        arms: Vec<(Pattern, Vec<Stmt>)>,
-        els: Option<Vec<Stmt>>,
-    },
-    While(Expr, Vec<Stmt>),
-    For(String, Expr, Vec<Stmt>),
-    Def(String, Vec<String>, Vec<Stmt>),
-    // class Name < base ... end  (methods are (name, params, body))
-    Class {
-        name: String,
-        base: String,
-        methods: Vec<(String, Vec<String>, Vec<Stmt>)>,
-        includes: Vec<String>,          // `include M` — mixin module names
-        forwards: Vec<(String, String)>, // `forward :m, to: @ivar` — (method, ivar)
-    },
-    // module Name ... end  — a bag of methods mixed into classes via `include`
-    Module {
-        name: String,
-        methods: Vec<(String, Vec<String>, Vec<Stmt>)>,
-    },
-    Return(Option<Expr>),
 }

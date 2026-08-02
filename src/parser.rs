@@ -1,27 +1,23 @@
-use crate::ast::{BinOp, Expr, Pattern, Stmt, UnOp};
+use crate::ast::{BinOp, Def, Expr, FnClause, Pattern, StrPart, TopItem, UnOp};
 use crate::token::Tok;
 
-// Type names usable as `when` patterns.
-const TYPE_NAMES: &[&str] = &[
-    "Nil", "Bool", "Number", "String", "Array", "Hash", "Model", "Agent", "Subagent", "Tool",
-    "Memory", "Rule", "Skill", "Hook",
-    "Command", "Graph", "Factory", "Charter", "Harness", "Class", "Instance", "Module", "Message",
-    "HookResult", "Function",
-];
+pub fn parse(toks: Vec<Tok>) -> Result<Vec<TopItem>, String> {
+    let mut p = Parser::new(toks);
+    p.program()
+}
 
-pub struct Parser {
+struct Parser {
     toks: Vec<Tok>,
     pos: usize,
 }
 
-pub fn parse(toks: Vec<Tok>) -> Result<Vec<Stmt>, String> {
-    let mut p = Parser { toks, pos: 0 };
-    p.program()
-}
-
 impl Parser {
+    fn new(toks: Vec<Tok>) -> Parser {
+        Parser { toks, pos: 0 }
+    }
+
     fn peek(&self) -> &Tok {
-        &self.toks[self.pos]
+        self.toks.get(self.pos).unwrap_or(&Tok::Eof)
     }
 
     fn peek_at(&self, k: usize) -> &Tok {
@@ -29,8 +25,8 @@ impl Parser {
     }
 
     fn advance(&mut self) -> Tok {
-        let t = self.toks[self.pos].clone();
-        if self.pos < self.toks.len() - 1 {
+        let t = self.peek().clone();
+        if self.pos < self.toks.len() {
             self.pos += 1;
         }
         t
@@ -55,374 +51,167 @@ impl Parser {
         }
     }
 
-    fn program(&mut self) -> Result<Vec<Stmt>, String> {
-        let mut stmts = Vec::new();
+    // ---- top level ----
+
+    fn program(&mut self) -> Result<Vec<TopItem>, String> {
+        let mut items = Vec::new();
         self.skip_newlines();
         while !self.check(&Tok::Eof) {
-            stmts.push(self.statement()?);
-            self.skip_newlines();
-        }
-        Ok(stmts)
-    }
-
-    // Parse a block until one of the terminators is seen (terminator not consumed).
-    fn block(&mut self, terminators: &[Tok]) -> Result<Vec<Stmt>, String> {
-        let mut stmts = Vec::new();
-        self.skip_newlines();
-        while !terminators.contains(self.peek()) && !self.check(&Tok::Eof) {
-            stmts.push(self.statement()?);
-            self.skip_newlines();
-        }
-        Ok(stmts)
-    }
-
-    fn statement(&mut self) -> Result<Stmt, String> {
-        match self.peek() {
-            Tok::If => self.if_stmt(),
-            Tok::Match => self.match_stmt(),
-            Tok::While => self.while_stmt(),
-            Tok::For => self.for_stmt(),
-            Tok::Def => self.def_stmt(),
-            Tok::Class => self.class_stmt(),
-            Tok::Module => self.module_stmt(),
-            Tok::Return => self.return_stmt(),
-            _ => Ok(Stmt::Expr(self.expr_statement()?)),
-        }
-    }
-
-    // Expression statement, with Ruby-style paren-less command calls:
-    //   puts "hi"      -> puts("hi")
-    //   agent.run x    -> agent.run(x)
-    fn expr_statement(&mut self) -> Result<Expr, String> {
-        let e = self.expr()?;
-        if !self.starts_argument() {
-            return Ok(e);
-        }
-        let args = self.command_args()?;
-        match e {
-            Expr::Ident(_) => Ok(Expr::Call(Box::new(e), args)),
-            Expr::Method(recv, name, existing) if existing.is_empty() => {
-                Ok(Expr::Method(recv, name, args))
-            }
-            _ => Err("unexpected argument after expression".into()),
-        }
-    }
-
-    fn command_args(&mut self) -> Result<Vec<Expr>, String> {
-        let mut args = vec![self.expr()?];
-        while self.check(&Tok::Comma) {
-            self.advance();
-            self.skip_newlines();
-            args.push(self.expr()?);
-        }
-        Ok(args)
-    }
-
-    // True when the next token can begin an argument to a paren-less call.
-    fn starts_argument(&self) -> bool {
-        matches!(
-            self.peek(),
-            Tok::Num(_)
-                | Tok::Str(_)
-                | Tok::Ident(_)
-                | Tok::True
-                | Tok::False
-                | Tok::Nil
-                | Tok::LBracket
-                | Tok::Bang
-        )
-    }
-
-    fn if_stmt(&mut self) -> Result<Stmt, String> {
-        self.eat(&Tok::If)?;
-        let cond = self.expr()?;
-        let then = self.block(&[Tok::Elsif, Tok::Else, Tok::End])?;
-        let mut elifs = Vec::new();
-        while self.check(&Tok::Elsif) {
-            self.advance();
-            let c = self.expr()?;
-            let b = self.block(&[Tok::Elsif, Tok::Else, Tok::End])?;
-            elifs.push((c, b));
-        }
-        let els = if self.check(&Tok::Else) {
-            self.advance();
-            Some(self.block(&[Tok::End])?)
-        } else {
-            None
-        };
-        self.eat(&Tok::End)?;
-        Ok(Stmt::If {
-            cond,
-            then,
-            elifs,
-            els,
-        })
-    }
-
-    fn match_stmt(&mut self) -> Result<Stmt, String> {
-        self.eat(&Tok::Match)?;
-        let subject = self.expr()?;
-        self.skip_newlines();
-        let mut arms = Vec::new();
-        while self.check(&Tok::When) {
-            self.advance();
-            let pat = self.pattern()?;
-            let body = self.block(&[Tok::When, Tok::Else, Tok::End])?;
-            arms.push((pat, body));
-        }
-        let els = if self.check(&Tok::Else) {
-            self.advance();
-            Some(self.block(&[Tok::End])?)
-        } else {
-            None
-        };
-        self.eat(&Tok::End)?;
-        Ok(Stmt::Match {
-            subject,
-            arms,
-            els,
-        })
-    }
-
-    fn pattern(&mut self) -> Result<Pattern, String> {
-        match self.peek().clone() {
-            Tok::Ident(name) if name == "_" => {
-                self.advance();
-                Ok(Pattern::Wildcard)
-            }
-            Tok::Ident(name) if TYPE_NAMES.contains(&name.as_str()) => {
-                self.advance();
-                Ok(Pattern::Type(name))
-            }
-            Tok::Ident(name) => {
-                self.advance();
-                Ok(Pattern::Bind(name))
-            }
-            _ => Ok(Pattern::Value(self.expr()?)),
-        }
-    }
-
-    fn while_stmt(&mut self) -> Result<Stmt, String> {
-        self.eat(&Tok::While)?;
-        let cond = self.expr()?;
-        let body = self.block(&[Tok::End])?;
-        self.eat(&Tok::End)?;
-        Ok(Stmt::While(cond, body))
-    }
-
-    fn for_stmt(&mut self) -> Result<Stmt, String> {
-        self.eat(&Tok::For)?;
-        let var = self.ident_name()?;
-        self.eat(&Tok::In)?;
-        let iter = self.expr()?;
-        let body = self.block(&[Tok::End])?;
-        self.eat(&Tok::End)?;
-        Ok(Stmt::For(var, iter, body))
-    }
-
-    fn def_stmt(&mut self) -> Result<Stmt, String> {
-        self.eat(&Tok::Def)?;
-        let name = self.ident_name()?;
-        let params = self.param_list()?;
-        let body = self.block(&[Tok::End])?;
-        self.eat(&Tok::End)?;
-        Ok(Stmt::Def(name, params, body))
-    }
-
-    // class Name < base
-    //   include Mixin
-    //   forward :method, to: @ivar
-    //   def method(params) ... end
-    // end
-    fn class_stmt(&mut self) -> Result<Stmt, String> {
-        self.eat(&Tok::Class)?;
-        let name = self.ident_name()?;
-        self.eat(&Tok::Lt)?;
-        let base = self.ident_name()?;
-        let mut methods = Vec::new();
-        let mut includes = Vec::new();
-        let mut forwards = Vec::new();
-        self.skip_newlines();
-        loop {
-            match self.peek() {
-                Tok::Def => methods.push(self.method_def()?),
-                Tok::Ident(s) if s == "include" => includes.extend(self.include_directive()?),
-                Tok::Ident(s) if s == "forward" => forwards.extend(self.forward_directive()?),
-                _ => break,
-            }
-            self.skip_newlines();
-        }
-        self.eat(&Tok::End)?;
-        Ok(Stmt::Class {
-            name,
-            base,
-            methods,
-            includes,
-            forwards,
-        })
-    }
-
-    // module Name
-    //   def method(params) ... end
-    // end
-    fn module_stmt(&mut self) -> Result<Stmt, String> {
-        self.eat(&Tok::Module)?;
-        let name = self.ident_name()?;
-        let mut methods = Vec::new();
-        self.skip_newlines();
-        while self.check(&Tok::Def) {
-            methods.push(self.method_def()?);
-            self.skip_newlines();
-        }
-        self.eat(&Tok::End)?;
-        Ok(Stmt::Module { name, methods })
-    }
-
-    // `def name(params) ... end` inside a class or module body.
-    fn method_def(&mut self) -> Result<(String, Vec<String>, Vec<Stmt>), String> {
-        self.eat(&Tok::Def)?;
-        let mname = self.ident_name()?;
-        let params = self.param_list()?;
-        let body = self.block(&[Tok::End])?;
-        self.eat(&Tok::End)?;
-        Ok((mname, params, body))
-    }
-
-    // `include A` or `include A, B` — module names to mix in.
-    fn include_directive(&mut self) -> Result<Vec<String>, String> {
-        self.advance(); // `include`
-        let mut names = vec![self.ident_name()?];
-        while self.check(&Tok::Comma) {
-            self.advance();
-            names.push(self.ident_name()?);
-        }
-        Ok(names)
-    }
-
-    // `forward :a, :b, to: @ivar` — delegate methods a and b to @ivar.
-    // Leading `:` on method names is optional sugar; `to:` names the target ivar.
-    fn forward_directive(&mut self) -> Result<Vec<(String, String)>, String> {
-        self.advance(); // `forward`
-        let mut methods = Vec::new();
-        loop {
-            if matches!(self.peek(), Tok::Ident(s) if s == "to") && self.peek_at(1) == &Tok::Colon {
-                break;
-            }
-            if self.check(&Tok::Colon) {
-                self.advance();
-            }
-            methods.push(self.ident_name()?);
-            if self.check(&Tok::Comma) {
-                self.advance();
-                self.skip_newlines();
+            if self.check(&Tok::Defmodule) {
+                items.push(self.module()?);
             } else {
-                break;
+                items.push(TopItem::Expr(self.expr()?));
             }
-        }
-        self.ident_name()?; // the `to` keyword
-        self.eat(&Tok::Colon)?;
-        let target = match self.advance() {
-            Tok::IVar(n) => n,
-            Tok::Ident(n) => n,
-            other => return Err(format!("forward target must be an ivar, found {:?}", other)),
-        };
-        Ok(methods.into_iter().map(|m| (m, target.clone())).collect())
-    }
-
-    // Anonymous function used as a value: def (params) ... end
-    fn lambda_expr(&mut self) -> Result<Expr, String> {
-        self.eat(&Tok::Def)?;
-        let params = self.param_list()?;
-        let body = self.block(&[Tok::End])?;
-        self.eat(&Tok::End)?;
-        Ok(Expr::Func(params, body))
-    }
-
-    fn param_list(&mut self) -> Result<Vec<String>, String> {
-        let mut params = Vec::new();
-        if self.check(&Tok::LParen) {
-            self.advance();
             self.skip_newlines();
-            while !self.check(&Tok::RParen) {
-                params.push(self.ident_name()?);
-                self.skip_newlines();
-                if self.check(&Tok::Comma) {
-                    self.advance();
-                    self.skip_newlines();
-                }
-            }
-            self.eat(&Tok::RParen)?;
         }
-        Ok(params)
+        Ok(items)
     }
 
-    fn return_stmt(&mut self) -> Result<Stmt, String> {
-        self.eat(&Tok::Return)?;
-        if self.check(&Tok::Newline) || self.check(&Tok::Eof) || self.check(&Tok::End) {
-            Ok(Stmt::Return(None))
-        } else {
-            Ok(Stmt::Return(Some(self.expr()?)))
+    fn module(&mut self) -> Result<TopItem, String> {
+        self.eat(&Tok::Defmodule)?;
+        let name = self.module_path()?;
+        self.eat(&Tok::Do)?;
+        self.skip_newlines();
+        let mut defs = Vec::new();
+        while self.check(&Tok::Def) || self.check(&Tok::Defp) {
+            defs.push(self.def()?);
+            self.skip_newlines();
+        }
+        self.eat(&Tok::End)?;
+        Ok(TopItem::Module { name, defs })
+    }
+
+    // `Alias(.Alias)*`
+    fn module_path(&mut self) -> Result<String, String> {
+        let mut path = self.alias_name()?;
+        while self.check(&Tok::Dot) && matches!(self.peek_at(1), Tok::Alias(_)) {
+            self.advance(); // .
+            path.push('.');
+            path.push_str(&self.alias_name()?);
+        }
+        Ok(path)
+    }
+
+    fn alias_name(&mut self) -> Result<String, String> {
+        match self.advance() {
+            Tok::Alias(a) => Ok(a),
+            other => Err(format!("expected a module alias, found {:?}", other)),
         }
     }
 
     fn ident_name(&mut self) -> Result<String, String> {
         match self.advance() {
             Tok::Ident(s) => Ok(s),
-            other => Err(format!("expected identifier, found {:?}", other)),
+            other => Err(format!("expected an identifier, found {:?}", other)),
         }
     }
 
-    // A method name after `.` — an identifier or a keyword used as a method,
-    // so Ruby-isms like `x.class` parse.
-    fn member_name(&mut self) -> Result<String, String> {
-        let word = match self.peek() {
-            Tok::Class => "class",
-            Tok::Module => "module",
-            Tok::Match => "match",
-            Tok::When => "when",
-            Tok::If => "if",
-            Tok::Elsif => "elsif",
-            Tok::Else => "else",
-            Tok::End => "end",
-            Tok::While => "while",
-            Tok::For => "for",
-            Tok::In => "in",
-            Tok::Def => "def",
-            Tok::Return => "return",
-            Tok::And => "and",
-            Tok::Or => "or",
-            Tok::Not => "not",
-            _ => return self.ident_name(),
+    fn def(&mut self) -> Result<Def, String> {
+        let private = self.check(&Tok::Defp);
+        self.advance(); // def / defp
+        let name = self.ident_name()?;
+        let params = if self.check(&Tok::LParen) {
+            self.pattern_params()?
+        } else {
+            Vec::new()
         };
-        self.advance();
-        Ok(word.to_string())
+        let guard = if self.check(&Tok::When) {
+            self.advance();
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        let body = self.def_body()?;
+        Ok(Def {
+            name,
+            params,
+            guard,
+            body,
+            private,
+        })
     }
 
-    // ---- expressions ----
+    // Either `do ... end` or `, do: expr`.
+    fn def_body(&mut self) -> Result<Vec<Expr>, String> {
+        if self.check(&Tok::Comma) {
+            self.advance();
+            self.expect_kwkey("do")?;
+            Ok(vec![self.expr()?])
+        } else {
+            self.eat(&Tok::Do)?;
+            let body = self.block(&[Tok::End])?;
+            self.eat(&Tok::End)?;
+            Ok(body)
+        }
+    }
+
+    fn expect_kwkey(&mut self, key: &str) -> Result<(), String> {
+        match self.advance() {
+            Tok::KwKey(k) if k == key => Ok(()),
+            other => Err(format!("expected `{}:`, found {:?}", key, other)),
+        }
+    }
+
+    // Parameters are patterns: parse as expressions, convert to patterns.
+    fn pattern_params(&mut self) -> Result<Vec<Pattern>, String> {
+        self.eat(&Tok::LParen)?;
+        self.skip_newlines();
+        let mut params = Vec::new();
+        while !self.check(&Tok::RParen) {
+            let e = self.expr()?;
+            params.push(expr_to_pattern(e)?);
+            self.skip_newlines();
+            if self.check(&Tok::Comma) {
+                self.advance();
+                self.skip_newlines();
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        Ok(params)
+    }
+
+    // A block: newline/`;`-separated expressions until a terminator.
+    fn block(&mut self, terminators: &[Tok]) -> Result<Vec<Expr>, String> {
+        let mut out = Vec::new();
+        self.skip_newlines();
+        while !terminators.contains(self.peek()) && !self.check(&Tok::Eof) {
+            out.push(self.expr()?);
+            self.skip_newlines();
+        }
+        Ok(out)
+    }
+
+    // ---- expressions (precedence climbing) ----
 
     fn expr(&mut self) -> Result<Expr, String> {
-        self.assignment()
+        self.match_expr()
     }
 
-    fn assignment(&mut self) -> Result<Expr, String> {
-        let left = self.or_expr()?;
-        if self.check(&Tok::Assign) {
+    fn match_expr(&mut self) -> Result<Expr, String> {
+        let left = self.pipe_expr()?;
+        if self.check(&Tok::Match) {
             self.advance();
-            let value = self.assignment()?;
-            match &left {
-                Expr::Ident(_) | Expr::IVar(_) | Expr::Index(_, _) => {
-                    Ok(Expr::Assign(Box::new(left), Box::new(value)))
-                }
-                _ => Err("invalid assignment target".into()),
-            }
+            let right = self.match_expr()?; // right associative
+            Ok(Expr::Match(Box::new(left), Box::new(right)))
         } else {
             Ok(left)
         }
     }
 
+    fn pipe_expr(&mut self) -> Result<Expr, String> {
+        let mut left = self.or_expr()?;
+        while self.check(&Tok::Pipe) {
+            self.advance();
+            self.skip_newlines();
+            let rhs = self.or_expr()?;
+            left = pipe_into(left, rhs)?;
+        }
+        Ok(left)
+    }
+
     fn or_expr(&mut self) -> Result<Expr, String> {
         let mut left = self.and_expr()?;
-        while self.check(&Tok::OrOr) || self.check(&Tok::Or) {
+        while self.check(&Tok::Or) || self.check(&Tok::OrOr) {
             self.advance();
             let right = self.and_expr()?;
             left = Expr::Binary(BinOp::Or, Box::new(left), Box::new(right));
@@ -431,34 +220,21 @@ impl Parser {
     }
 
     fn and_expr(&mut self) -> Result<Expr, String> {
-        let mut left = self.equality()?;
-        while self.check(&Tok::AndAnd) || self.check(&Tok::And) {
+        let mut left = self.cmp_expr()?;
+        while self.check(&Tok::And) || self.check(&Tok::AndAnd) {
             self.advance();
-            let right = self.equality()?;
+            let right = self.cmp_expr()?;
             left = Expr::Binary(BinOp::And, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
-    fn equality(&mut self) -> Result<Expr, String> {
-        let mut left = self.comparison()?;
+    fn cmp_expr(&mut self) -> Result<Expr, String> {
+        let mut left = self.concat_expr()?;
         loop {
             let op = match self.peek() {
-                Tok::Eq => BinOp::Eq,
-                Tok::Neq => BinOp::Neq,
-                _ => break,
-            };
-            self.advance();
-            let right = self.comparison()?;
-            left = Expr::Binary(op, Box::new(left), Box::new(right));
-        }
-        Ok(left)
-    }
-
-    fn comparison(&mut self) -> Result<Expr, String> {
-        let mut left = self.term()?;
-        loop {
-            let op = match self.peek() {
+                Tok::EqEq => BinOp::Eq,
+                Tok::NotEq => BinOp::Neq,
                 Tok::Lt => BinOp::Lt,
                 Tok::Gt => BinOp::Gt,
                 Tok::Le => BinOp::Le,
@@ -466,14 +242,30 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            let right = self.term()?;
+            let right = self.concat_expr()?;
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
-    fn term(&mut self) -> Result<Expr, String> {
-        let mut left = self.factor()?;
+    fn concat_expr(&mut self) -> Result<Expr, String> {
+        let mut left = self.add_expr()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Concat => BinOp::Concat,
+                Tok::ListConcat => BinOp::ListConcat,
+                Tok::ListDiff => BinOp::ListDiff,
+                _ => break,
+            };
+            self.advance();
+            let right = self.add_expr()?;
+            left = Expr::Binary(op, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn add_expr(&mut self) -> Result<Expr, String> {
+        let mut left = self.mul_expr()?;
         loop {
             let op = match self.peek() {
                 Tok::Plus => BinOp::Add,
@@ -481,37 +273,36 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            let right = self.factor()?;
+            let right = self.mul_expr()?;
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
-    fn factor(&mut self) -> Result<Expr, String> {
-        let mut left = self.unary()?;
+    fn mul_expr(&mut self) -> Result<Expr, String> {
+        let mut left = self.unary_expr()?;
         loop {
             let op = match self.peek() {
                 Tok::Star => BinOp::Mul,
                 Tok::Slash => BinOp::Div,
-                Tok::Percent => BinOp::Mod,
                 _ => break,
             };
             self.advance();
-            let right = self.unary()?;
+            let right = self.unary_expr()?;
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
-    fn unary(&mut self) -> Result<Expr, String> {
+    fn unary_expr(&mut self) -> Result<Expr, String> {
         match self.peek() {
             Tok::Minus => {
                 self.advance();
-                Ok(Expr::Unary(UnOp::Neg, Box::new(self.unary()?)))
+                Ok(Expr::Unary(UnOp::Neg, Box::new(self.unary_expr()?)))
             }
-            Tok::Bang | Tok::Not => {
+            Tok::Not | Tok::Bang => {
                 self.advance();
-                Ok(Expr::Unary(UnOp::Not, Box::new(self.unary()?)))
+                Ok(Expr::Unary(UnOp::Not, Box::new(self.unary_expr()?)))
             }
             _ => self.postfix(),
         }
@@ -519,86 +310,31 @@ impl Parser {
 
     fn postfix(&mut self) -> Result<Expr, String> {
         let mut e = self.primary()?;
-        loop {
-            match self.peek() {
-                Tok::Dot => {
-                    self.advance();
-                    let name = self.member_name()?;
-                    let args = if self.check(&Tok::LParen) {
-                        self.arg_list()?
-                    } else {
-                        Vec::new()
-                    };
-                    e = Expr::Method(Box::new(e), name, args);
-                }
-                Tok::LParen => {
-                    let args = self.arg_list()?;
-                    e = Expr::Call(Box::new(e), args);
-                }
-                // `name { ... }` is a call with a single config hash, so legacy
-                // constructors read naturally: rule { name: "x", text: "y" }.
-                Tok::LBrace => {
-                    let hash = self.hash_literal()?;
-                    e = Expr::Call(Box::new(e), vec![hash]);
-                }
-                Tok::LBracket => {
-                    self.advance();
-                    self.skip_newlines();
-                    let idx = self.expr()?;
-                    self.skip_newlines();
-                    self.eat(&Tok::RBracket)?;
-                    e = Expr::Index(Box::new(e), Box::new(idx));
-                }
-                _ => break,
+        // Field access on a value: `value.field` (lowercase field).
+        while self.check(&Tok::Dot) && matches!(self.peek_at(1), Tok::Ident(_)) {
+            self.advance(); // .
+            let field = self.ident_name()?;
+            if self.check(&Tok::LParen) {
+                return Err("calling a method on a value is not supported; use Module.fun(value)".into());
             }
+            e = Expr::Field(Box::new(e), field);
         }
         Ok(e)
     }
 
-    // Positional args, with Ruby-style trailing keyword args folded into one
-    // hash: `f(a, k: v, j: w)` -> `f(a, { k: v, j: w })`. Lets constructors
-    // read `Agent.new(model: "...", system: "...")`.
-    fn arg_list(&mut self) -> Result<Vec<Expr>, String> {
-        self.eat(&Tok::LParen)?;
-        self.skip_newlines();
-        let mut args = Vec::new();
-        let mut pairs = Vec::new();
-        while !self.check(&Tok::RParen) {
-            if self.starts_keyword_arg() {
-                let key = self.hash_key()?;
-                self.eat(&Tok::Colon)?;
-                self.skip_newlines();
-                pairs.push((key, self.expr()?));
-            } else {
-                args.push(self.expr()?);
-            }
-            self.skip_newlines();
-            if self.check(&Tok::Comma) {
-                self.advance();
-                self.skip_newlines();
-            }
-        }
-        self.eat(&Tok::RParen)?;
-        if !pairs.is_empty() {
-            args.push(Expr::Hash(pairs));
-        }
-        Ok(args)
-    }
-
-    // A `key:` at the start of an argument marks a keyword argument.
-    fn starts_keyword_arg(&self) -> bool {
-        matches!(self.peek(), Tok::Ident(_) | Tok::Str(_)) && self.peek_at(1) == &Tok::Colon
-    }
-
     fn primary(&mut self) -> Result<Expr, String> {
         match self.peek().clone() {
-            Tok::Num(n) => {
+            Tok::Int(n) => {
                 self.advance();
-                Ok(Expr::Num(n))
+                Ok(Expr::Int(n))
             }
-            Tok::Str(s) => {
+            Tok::Float(f) => {
                 self.advance();
-                Ok(Expr::Str(s))
+                Ok(Expr::Float(f))
+            }
+            Tok::Atom(a) => {
+                self.advance();
+                Ok(Expr::Atom(a))
             }
             Tok::True => {
                 self.advance();
@@ -612,14 +348,20 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Nil)
             }
+            Tok::Str(raw) => {
+                self.advance();
+                Ok(Expr::Str(parse_interpolation(&raw)?))
+            }
             Tok::Ident(name) => {
                 self.advance();
-                Ok(Expr::Ident(name))
+                if self.check(&Tok::LParen) {
+                    let args = self.arg_list()?;
+                    Ok(Expr::LocalCall(name, args))
+                } else {
+                    Ok(Expr::Var(name))
+                }
             }
-            Tok::IVar(name) => {
-                self.advance();
-                Ok(Expr::IVar(name))
-            }
+            Tok::Alias(_) => self.alias_primary(),
             Tok::LParen => {
                 self.advance();
                 self.skip_newlines();
@@ -628,18 +370,101 @@ impl Parser {
                 self.eat(&Tok::RParen)?;
                 Ok(e)
             }
-            Tok::LBracket => self.array_literal(),
-            Tok::LBrace => self.hash_literal(),
-            Tok::Def => self.lambda_expr(),
+            Tok::LBracket => self.list_literal(),
+            Tok::LBrace => self.tuple_literal(),
+            Tok::MapOpen => self.map_literal(),
+            Tok::Fn => self.fn_literal(),
+            Tok::If => self.if_expr(),
             other => Err(format!("unexpected token {:?}", other)),
         }
     }
 
-    fn array_literal(&mut self) -> Result<Expr, String> {
+    // A capitalized alias: a module path, then optionally `.fun(args)`.
+    fn alias_primary(&mut self) -> Result<Expr, String> {
+        let path = self.module_path()?;
+        if self.check(&Tok::Dot) && matches!(self.peek_at(1), Tok::Ident(_)) {
+            self.advance(); // .
+            let fun = self.ident_name()?;
+            let args = if self.check(&Tok::LParen) {
+                self.arg_list()?
+            } else {
+                Vec::new()
+            };
+            Ok(Expr::RemoteCall(path, fun, args))
+        } else {
+            Ok(Expr::ModuleRef(path))
+        }
+    }
+
+    // Positional args, then trailing `key: value` folded into one keyword list.
+    fn arg_list(&mut self) -> Result<Vec<Expr>, String> {
+        self.eat(&Tok::LParen)?;
+        self.skip_newlines();
+        let mut args = Vec::new();
+        let mut kw = Vec::new();
+        while !self.check(&Tok::RParen) {
+            if let Tok::KwKey(k) = self.peek().clone() {
+                self.advance();
+                self.skip_newlines();
+                let v = self.expr()?;
+                kw.push(Expr::Tuple(vec![Expr::Atom(k), v]));
+            } else {
+                args.push(self.expr()?);
+            }
+            self.skip_newlines();
+            if self.check(&Tok::Comma) {
+                self.advance();
+                self.skip_newlines();
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        if !kw.is_empty() {
+            args.push(Expr::List(kw));
+        }
+        Ok(args)
+    }
+
+    fn list_literal(&mut self) -> Result<Expr, String> {
         self.eat(&Tok::LBracket)?;
         self.skip_newlines();
+        if self.check(&Tok::RBracket) {
+            self.advance();
+            return Ok(Expr::List(Vec::new()));
+        }
+        // keyword-list form: `[key: v, ...]`
+        if matches!(self.peek(), Tok::KwKey(_)) {
+            let pairs = self.keyword_pairs(&Tok::RBracket)?;
+            self.eat(&Tok::RBracket)?;
+            return Ok(Expr::List(pairs));
+        }
+        let head = self.expr()?;
+        if self.check(&Tok::Bar) {
+            self.advance();
+            let tail = self.expr()?;
+            self.skip_newlines();
+            self.eat(&Tok::RBracket)?;
+            return Ok(Expr::Cons(Box::new(head), Box::new(tail)));
+        }
+        let mut items = vec![head];
+        self.skip_newlines();
+        while self.check(&Tok::Comma) {
+            self.advance();
+            self.skip_newlines();
+            if self.check(&Tok::RBracket) {
+                break;
+            }
+            items.push(self.expr()?);
+            self.skip_newlines();
+        }
+        self.eat(&Tok::RBracket)?;
+        Ok(Expr::List(items))
+    }
+
+    fn tuple_literal(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::LBrace)?;
+        self.skip_newlines();
         let mut items = Vec::new();
-        while !self.check(&Tok::RBracket) {
+        while !self.check(&Tok::RBrace) {
             items.push(self.expr()?);
             self.skip_newlines();
             if self.check(&Tok::Comma) {
@@ -647,20 +472,27 @@ impl Parser {
                 self.skip_newlines();
             }
         }
-        self.eat(&Tok::RBracket)?;
-        Ok(Expr::Array(items))
+        self.eat(&Tok::RBrace)?;
+        Ok(Expr::Tuple(items))
     }
 
-    fn hash_literal(&mut self) -> Result<Expr, String> {
-        self.eat(&Tok::LBrace)?;
+    fn map_literal(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::MapOpen)?;
         self.skip_newlines();
         let mut pairs = Vec::new();
         while !self.check(&Tok::RBrace) {
-            let key = self.hash_key()?;
-            self.eat(&Tok::Colon)?;
-            self.skip_newlines();
-            let val = self.expr()?;
-            pairs.push((key, val));
+            if let Tok::KwKey(k) = self.peek().clone() {
+                self.advance();
+                self.skip_newlines();
+                let v = self.expr()?;
+                pairs.push((Expr::Atom(k), v));
+            } else {
+                let key = self.expr()?;
+                self.eat(&Tok::FatArrow)?;
+                self.skip_newlines();
+                let v = self.expr()?;
+                pairs.push((key, v));
+            }
             self.skip_newlines();
             if self.check(&Tok::Comma) {
                 self.advance();
@@ -668,15 +500,224 @@ impl Parser {
             }
         }
         self.eat(&Tok::RBrace)?;
-        Ok(Expr::Hash(pairs))
+        Ok(Expr::Map(pairs))
     }
 
-    fn hash_key(&mut self) -> Result<String, String> {
-        match self.advance() {
-            Tok::Ident(s) => Ok(s),
-            Tok::Str(s) => Ok(s),
-            other => Err(format!("expected hash key, found {:?}", other)),
+    // `key: v, key2: v2` — used inside a keyword list literal.
+    fn keyword_pairs(&mut self, end: &Tok) -> Result<Vec<Expr>, String> {
+        let mut pairs = Vec::new();
+        while !self.check(end) {
+            let key = match self.advance() {
+                Tok::KwKey(k) => k,
+                other => return Err(format!("expected `key:`, found {:?}", other)),
+            };
+            self.skip_newlines();
+            let v = self.expr()?;
+            pairs.push(Expr::Tuple(vec![Expr::Atom(key), v]));
+            self.skip_newlines();
+            if self.check(&Tok::Comma) {
+                self.advance();
+                self.skip_newlines();
+            }
+        }
+        Ok(pairs)
+    }
+
+    fn fn_literal(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::Fn)?;
+        let mut clauses = Vec::new();
+        loop {
+            self.skip_newlines();
+            let params = self.fn_params()?;
+            let guard = if self.check(&Tok::When) {
+                self.advance();
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            self.eat(&Tok::Arrow)?;
+            let body = self.block(&[Tok::End, Tok::Fn])?;
+            clauses.push(FnClause { params, guard, body });
+            self.skip_newlines();
+            if self.check(&Tok::End) {
+                break;
+            }
+        }
+        self.eat(&Tok::End)?;
+        Ok(Expr::Fn(clauses))
+    }
+
+    // fn params: `a, b ->` (no surrounding parens in Elixir).
+    fn fn_params(&mut self) -> Result<Vec<Pattern>, String> {
+        let mut params = Vec::new();
+        while !self.check(&Tok::Arrow) && !self.check(&Tok::When) {
+            let e = self.expr()?;
+            params.push(expr_to_pattern(e)?);
+            if self.check(&Tok::Comma) {
+                self.advance();
+                self.skip_newlines();
+            } else {
+                break;
+            }
+        }
+        Ok(params)
+    }
+
+    fn if_expr(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::If)?;
+        let cond = self.expr()?;
+        // keyword form: `if c, do: x, else: y`
+        if self.check(&Tok::Comma) {
+            self.advance();
+            self.expect_kwkey("do")?;
+            let then = self.expr()?;
+            let els = if self.check(&Tok::Comma) {
+                self.advance();
+                self.expect_kwkey("else")?;
+                Some(vec![self.expr()?])
+            } else {
+                None
+            };
+            return Ok(Expr::If(Box::new(cond), vec![then], els));
+        }
+        self.eat(&Tok::Do)?;
+        let then = self.block(&[Tok::Else, Tok::End])?;
+        let els = if self.check(&Tok::Else) {
+            self.advance();
+            Some(self.block(&[Tok::End])?)
+        } else {
+            None
+        };
+        self.eat(&Tok::End)?;
+        Ok(Expr::If(Box::new(cond), then, els))
+    }
+}
+
+// `left |> f(args)` becomes `f(left, args...)`.
+fn pipe_into(left: Expr, rhs: Expr) -> Result<Expr, String> {
+    match rhs {
+        Expr::LocalCall(name, mut args) => {
+            args.insert(0, left);
+            Ok(Expr::LocalCall(name, args))
+        }
+        Expr::RemoteCall(m, f, mut args) => {
+            args.insert(0, left);
+            Ok(Expr::RemoteCall(m, f, args))
+        }
+        Expr::Var(name) => Ok(Expr::LocalCall(name, vec![left])),
+        Expr::ModuleRef(_) => Err("cannot pipe into a bare module".into()),
+        _ => Err("the right side of |> must be a function call".into()),
+    }
+}
+
+// Convert an expression used in pattern position into a Pattern.
+pub fn expr_to_pattern(e: Expr) -> Result<Pattern, String> {
+    Ok(match e {
+        Expr::Var(name) if name == "_" || name.starts_with('_') => {
+            if name == "_" {
+                Pattern::Wildcard
+            } else {
+                Pattern::Var(name)
+            }
+        }
+        Expr::Var(name) => Pattern::Var(name),
+        Expr::Int(n) => Pattern::Int(n),
+        Expr::Float(f) => Pattern::Float(f),
+        Expr::Atom(a) => Pattern::Atom(a),
+        Expr::Bool(b) => Pattern::Bool(b),
+        Expr::Nil => Pattern::Nil,
+        Expr::Str(parts) => match single_literal(&parts) {
+            Some(s) => Pattern::Str(s),
+            None => return Err("string interpolation is not allowed in a pattern".into()),
+        },
+        Expr::Tuple(items) => {
+            Pattern::Tuple(items.into_iter().map(expr_to_pattern).collect::<Result<_, _>>()?)
+        }
+        Expr::List(items) => {
+            Pattern::List(items.into_iter().map(expr_to_pattern).collect::<Result<_, _>>()?)
+        }
+        Expr::Cons(h, t) => {
+            Pattern::Cons(Box::new(expr_to_pattern(*h)?), Box::new(expr_to_pattern(*t)?))
+        }
+        Expr::Map(pairs) => {
+            let mut out = Vec::new();
+            for (k, v) in pairs {
+                out.push((k, expr_to_pattern(v)?));
+            }
+            Pattern::Map(out)
+        }
+        other => return Err(format!("invalid pattern: {:?}", other)),
+    })
+}
+
+fn single_literal(parts: &[StrPart]) -> Option<String> {
+    match parts {
+        [] => Some(String::new()),
+        [StrPart::Lit(s)] => Some(s.clone()),
+        _ => None,
+    }
+}
+
+// Split a raw string into literal chunks and `#{ expr }` interpolations.
+fn parse_interpolation(raw: &str) -> Result<Vec<StrPart>, String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut parts = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '#' && chars.get(i + 1) == Some(&'{') {
+            if !lit.is_empty() {
+                parts.push(StrPart::Lit(std::mem::take(&mut lit)));
+            }
+            let (inner, next) = scan_interpolation(&chars, i + 2)?;
+            parts.push(StrPart::Expr(parse_embedded(&inner)?));
+            i = next;
+        } else {
+            lit.push(chars[i]);
+            i += 1;
         }
     }
+    if !lit.is_empty() {
+        parts.push(StrPart::Lit(lit));
+    }
+    Ok(parts)
+}
 
+// Reads the body of a `#{ ... }` starting just after `#{`, returning the inner
+// source and the index past the closing `}`.
+fn scan_interpolation(chars: &[char], start: usize) -> Result<(String, usize), String> {
+    let mut depth = 1;
+    let mut j = start;
+    let mut inner = String::new();
+    while j < chars.len() && depth > 0 {
+        match chars[j] {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        inner.push(chars[j]);
+        j += 1;
+    }
+    if depth != 0 {
+        return Err("unterminated #{ } in string".into());
+    }
+    Ok((inner, j + 1))
+}
+
+// Parse a single embedded expression (an interpolation body).
+fn parse_embedded(src: &str) -> Result<Expr, String> {
+    let toks = crate::lexer::lex(src)?;
+    let mut p = Parser::new(toks);
+    p.skip_newlines();
+    let e = p.expr()?;
+    p.skip_newlines();
+    if !p.check(&Tok::Eof) {
+        return Err("unexpected tokens in interpolation".into());
+    }
+    Ok(e)
 }

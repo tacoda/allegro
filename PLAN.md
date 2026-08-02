@@ -305,8 +305,10 @@ graph routing; delegation; fan_out.
 
 **Phase 5 — Ergonomics & docs.**
 `*rest` variadic, `for` comprehensions, sigils (optional), finalized
-`{:ok,_}` conventions, rewritten `examples/` + `README.md`.
-*Verify:* examples run; README snippets execute.
+`{:ok,_}` conventions, `README.md`, and **a 25-file tutorial** in `examples/` of
+growing complexity — each a standalone, runnable `.al` (01 basics → 25 full
+multi-agent composition).
+*Verify:* every one of the 25 examples runs.
 
 ## 8. Decisions (LOCKED)
 

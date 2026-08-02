@@ -1,1233 +1,559 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::ast::{BinOp, Expr, Pattern, Stmt, UnOp};
-use crate::builtins;
-use serde_json::json;
-
-use crate::openai::ToolCall;
-use crate::value::{
-    new_env, AgentObj, Class, Command, Env, Factory, Func, Graph, Harness, Message, Skill, Tool,
-    Value,
-};
-
-// Control-flow signal so `return` can unwind through blocks.
-enum Flow {
-    Normal(Value),
-    Return(Value),
-}
+use crate::ast::{BinOp, Def, Expr, Pattern, StrPart, TopItem, UnOp};
+use crate::parser::expr_to_pattern;
+use crate::value::{new_env, values_equal, Env, Fun, Value};
 
 pub struct Interp {
-    pub global: Env,
+    // module name -> (function name, arity) -> clauses (tried in order)
+    modules: HashMap<String, HashMap<(String, usize), Vec<Rc<Def>>>>,
+    global: Env,
+    // stack of the module whose body is executing, for local-call resolution
+    current: Vec<String>,
 }
 
 impl Interp {
     pub fn new() -> Interp {
-        let global = new_env(None);
-        builtins::register(&global);
-        install_env_hash(&global);
-        Interp { global }
+        Interp {
+            modules: HashMap::new(),
+            global: new_env(None),
+            current: Vec::new(),
+        }
     }
 
-    pub fn run(&mut self, program: &[Stmt]) -> Result<(), String> {
-        let env = self.global.clone();
-        for stmt in program {
-            if let Flow::Return(_) = self.exec(stmt, &env)? {
-                break;
+    pub fn run(&mut self, program: &[TopItem]) -> Result<(), String> {
+        for item in program {
+            if let TopItem::Module { name, defs } = item {
+                self.register(name, defs);
+            }
+        }
+        for item in program {
+            if let TopItem::Expr(e) = item {
+                let env = self.global.clone();
+                self.eval(e, &env)?;
             }
         }
         Ok(())
     }
 
-    fn exec_block(&mut self, stmts: &[Stmt], env: &Env) -> Result<Flow, String> {
-        let mut last = Value::Nil;
-        for stmt in stmts {
-            match self.exec(stmt, env)? {
-                Flow::Return(v) => return Ok(Flow::Return(v)),
-                Flow::Normal(v) => last = v,
-            }
-        }
-        Ok(Flow::Normal(last))
-    }
-
-    fn exec(&mut self, stmt: &Stmt, env: &Env) -> Result<Flow, String> {
-        match stmt {
-            Stmt::Expr(e) => Ok(Flow::Normal(self.eval(e, env)?)),
-            Stmt::Return(e) => {
-                let v = match e {
-                    Some(e) => self.eval(e, env)?,
-                    None => Value::Nil,
-                };
-                Ok(Flow::Return(v))
-            }
-            Stmt::If {
-                cond,
-                then,
-                elifs,
-                els,
-            } => self.exec_if(cond, then, elifs, els, env),
-            Stmt::Match {
-                subject,
-                arms,
-                els,
-            } => self.exec_match(subject, arms, els, env),
-            Stmt::While(cond, body) => self.exec_while(cond, body, env),
-            Stmt::For(var, iter, body) => self.exec_for(var, iter, body, env),
-            Stmt::Def(name, params, body) => {
-                let f = Value::Func(Rc::new(Func {
-                    params: params.clone(),
-                    body: body.clone(),
-                    closure: env.clone(),
-                }));
-                env.borrow_mut().define(name, f);
-                Ok(Flow::Normal(Value::Nil))
-            }
-            Stmt::Class {
-                name,
-                base,
-                methods,
-                includes,
-                forwards,
-            } => self.exec_class(name, base, methods, includes, forwards, env),
-            Stmt::Module { name, methods } => self.exec_module(name, methods, env),
+    fn register(&mut self, name: &str, defs: &[Def]) {
+        let table = self.modules.entry(name.to_string()).or_default();
+        for def in defs {
+            table
+                .entry((def.name.clone(), def.params.len()))
+                .or_default()
+                .push(Rc::new(def.clone()));
         }
     }
 
-    fn exec_class(
-        &mut self,
-        name: &str,
-        base: &str,
-        methods: &[(String, Vec<String>, Vec<Stmt>)],
-        includes: &[String],
-        forwards: &[(String, String)],
-        env: &Env,
-    ) -> Result<Flow, String> {
-        // A base of another class name means class-to-class inheritance;
-        // otherwise it names a primitive kind.
-        let (base_kind, parent) = match env.borrow().get(base) {
-            Some(Value::Class(p)) => (p.base.clone(), Some(p)),
-            _ => (base.to_string(), None),
-        };
-        let mut modules = Vec::new();
-        for m in includes {
-            match env.borrow().get(m) {
-                Some(Value::Module(module)) => modules.push(module),
-                _ => return Err(format!("include: '{}' is not a module", m)),
-            }
-        }
-        let class = Value::Class(Rc::new(Class {
-            name: name.to_string(),
-            base: base_kind,
-            parent,
-            methods: self.method_map(methods, env),
-            modules,
-            forwards: forwards.to_vec(),
-        }));
-        env.borrow_mut().define(name, class);
-        Ok(Flow::Normal(Value::Nil))
-    }
+    // ---- evaluation ----
 
-    fn exec_module(
-        &mut self,
-        name: &str,
-        methods: &[(String, Vec<String>, Vec<Stmt>)],
-        env: &Env,
-    ) -> Result<Flow, String> {
-        let module = Value::Module(Rc::new(crate::value::Module {
-            name: name.to_string(),
-            methods: self.method_map(methods, env),
-        }));
-        env.borrow_mut().define(name, module);
-        Ok(Flow::Normal(Value::Nil))
-    }
-
-    // Compile a list of (name, params, body) into callable methods closing over `env`.
-    fn method_map(
-        &self,
-        methods: &[(String, Vec<String>, Vec<Stmt>)],
-        env: &Env,
-    ) -> HashMap<String, Rc<Func>> {
-        let mut map = HashMap::new();
-        for (mname, params, body) in methods {
-            map.insert(
-                mname.clone(),
-                Rc::new(Func {
-                    params: params.clone(),
-                    body: body.clone(),
-                    closure: env.clone(),
-                }),
-            );
-        }
-        map
-    }
-
-    fn exec_if(
-        &mut self,
-        cond: &Expr,
-        then: &[Stmt],
-        elifs: &[(Expr, Vec<Stmt>)],
-        els: &Option<Vec<Stmt>>,
-        env: &Env,
-    ) -> Result<Flow, String> {
-        if self.eval(cond, env)?.truthy() {
-            return self.exec_block(then, env);
-        }
-        for (c, body) in elifs {
-            if self.eval(c, env)?.truthy() {
-                return self.exec_block(body, env);
-            }
-        }
-        if let Some(body) = els {
-            return self.exec_block(body, env);
-        }
-        Ok(Flow::Normal(Value::Nil))
-    }
-
-    fn exec_match(
-        &mut self,
-        subject: &Expr,
-        arms: &[(Pattern, Vec<Stmt>)],
-        els: &Option<Vec<Stmt>>,
-        env: &Env,
-    ) -> Result<Flow, String> {
-        let value = self.eval(subject, env)?;
-        for (pat, body) in arms {
-            match pat {
-                Pattern::Wildcard => return self.exec_block(body, env),
-                Pattern::Type(t) => {
-                    if type_matches(t, &value) {
-                        return self.exec_block(body, env);
-                    }
-                }
-                Pattern::Bind(name) => {
-                    let arm_env = new_env(Some(env.clone()));
-                    arm_env.borrow_mut().define(name, value.clone());
-                    return self.exec_block(body, &arm_env);
-                }
-                Pattern::Value(expr) => {
-                    let pv = self.eval(expr, env)?;
-                    if values_equal(&pv, &value) {
-                        return self.exec_block(body, env);
-                    }
-                }
-            }
-        }
-        if let Some(body) = els {
-            return self.exec_block(body, env);
-        }
-        Ok(Flow::Normal(Value::Nil))
-    }
-
-    fn exec_while(&mut self, cond: &Expr, body: &[Stmt], env: &Env) -> Result<Flow, String> {
-        while self.eval(cond, env)?.truthy() {
-            if let Flow::Return(v) = self.exec_block(body, env)? {
-                return Ok(Flow::Return(v));
-            }
-        }
-        Ok(Flow::Normal(Value::Nil))
-    }
-
-    fn exec_for(
-        &mut self,
-        var: &str,
-        iter: &Expr,
-        body: &[Stmt],
-        env: &Env,
-    ) -> Result<Flow, String> {
-        let items = match self.eval(iter, env)? {
-            Value::Array(a) => a.borrow().clone(),
-            other => return Err(format!("cannot iterate over {}", other.type_name())),
-        };
-        for item in items {
-            let loop_env = new_env(Some(env.clone()));
-            loop_env.borrow_mut().define(var, item);
-            if let Flow::Return(v) = self.exec_block(body, &loop_env)? {
-                return Ok(Flow::Return(v));
-            }
-        }
-        Ok(Flow::Normal(Value::Nil))
-    }
-
-    fn eval(&mut self, expr: &Expr, env: &Env) -> Result<Value, String> {
-        match expr {
-            Expr::Num(n) => Ok(Value::Num(*n)),
-            Expr::Str(s) => Ok(Value::Str(s.clone())),
+    fn eval(&mut self, e: &Expr, env: &Env) -> Result<Value, String> {
+        match e {
+            Expr::Int(n) => Ok(Value::Int(*n)),
+            Expr::Float(f) => Ok(Value::Float(*f)),
+            Expr::Atom(a) => Ok(Value::Atom(a.clone())),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Nil => Ok(Value::Nil),
-            Expr::Ident(name) => env
+            Expr::Str(parts) => self.eval_string(parts, env),
+            Expr::Var(name) => env
                 .borrow()
                 .get(name)
                 .ok_or_else(|| format!("undefined variable '{}'", name)),
-            Expr::IVar(name) => {
-                let inst = self.current_instance(env)?;
-                let v = inst.ivars.borrow().get(name).cloned();
-                Ok(v.unwrap_or(Value::Nil))
-            }
-            Expr::Array(items) => {
-                let mut vals = Vec::with_capacity(items.len());
+            Expr::List(items) => {
+                let mut out = Vec::with_capacity(items.len());
                 for it in items {
-                    vals.push(self.eval(it, env)?);
+                    out.push(self.eval(it, env)?);
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(vals))))
+                Ok(Value::list(out))
             }
-            Expr::Hash(pairs) => {
-                let mut map = HashMap::new();
-                for (k, v) in pairs {
-                    map.insert(k.clone(), self.eval(v, env)?);
-                }
-                Ok(Value::Hash(Rc::new(RefCell::new(map))))
-            }
-            Expr::Index(base, idx) => self.eval_index(base, idx, env),
-            Expr::Unary(op, e) => self.eval_unary(*op, e, env),
+            Expr::Cons(h, t) => self.eval_cons(h, t, env),
+            Expr::Tuple(items) => Ok(Value::tuple(self.eval_args(items, env)?)),
+            Expr::Map(pairs) => self.eval_map(pairs, env),
+            Expr::Block(stmts) => self.eval_block(stmts, env),
+            Expr::Match(lhs, rhs) => self.eval_match(lhs, rhs, env),
             Expr::Binary(op, l, r) => self.eval_binary(*op, l, r, env),
-            Expr::Assign(target, value) => self.eval_assign(target, value, env),
-            Expr::Call(callee, args) => self.eval_call(callee, args, env),
-            Expr::Method(recv, name, args) => self.eval_method(recv, name, args, env),
-            Expr::Func(params, body) => Ok(Value::Func(Rc::new(Func {
-                params: params.clone(),
-                body: body.clone(),
+            Expr::Unary(op, x) => self.eval_unary(*op, x, env),
+            Expr::LocalCall(name, args) => {
+                let argv = self.eval_args(args, env)?;
+                self.local_call(name, argv)
+            }
+            Expr::RemoteCall(m, f, args) => {
+                let argv = self.eval_args(args, env)?;
+                self.remote_call(m, f, argv)
+            }
+            Expr::Field(base, field) => self.eval_field(base, field, env),
+            Expr::ModuleRef(m) => Err(format!("module {} is not a value", m)),
+            Expr::Fn(clauses) => Ok(Value::Fun(Rc::new(Fun {
+                clauses: clauses.clone(),
                 closure: env.clone(),
             }))),
+            Expr::If(cond, then, els) => {
+                if self.eval(cond, env)?.truthy() {
+                    self.eval_block(then, env)
+                } else if let Some(body) = els {
+                    self.eval_block(body, env)
+                } else {
+                    Ok(Value::Nil)
+                }
+            }
         }
     }
 
-    fn eval_index(&mut self, base: &Expr, idx: &Expr, env: &Env) -> Result<Value, String> {
-        let b = self.eval(base, env)?;
-        let i = self.eval(idx, env)?;
-        match b {
-            Value::Array(a) => {
-                let n = as_index(&i)?;
-                Ok(a.borrow().get(n).cloned().unwrap_or(Value::Nil))
+    fn eval_block(&mut self, stmts: &[Expr], env: &Env) -> Result<Value, String> {
+        let mut last = Value::Nil;
+        for s in stmts {
+            last = self.eval(s, env)?;
+        }
+        Ok(last)
+    }
+
+    fn eval_args(&mut self, args: &[Expr], env: &Env) -> Result<Vec<Value>, String> {
+        let mut out = Vec::with_capacity(args.len());
+        for a in args {
+            out.push(self.eval(a, env)?);
+        }
+        Ok(out)
+    }
+
+    fn eval_cons(&mut self, h: &Expr, t: &Expr, env: &Env) -> Result<Value, String> {
+        let head = self.eval(h, env)?;
+        match self.eval(t, env)? {
+            Value::List(items) => {
+                let mut v = Vec::with_capacity(items.len() + 1);
+                v.push(head);
+                v.extend(items.iter().cloned());
+                Ok(Value::list(v))
             }
-            Value::Hash(h) => Ok(h.borrow().get(&i.to_string()).cloned().unwrap_or(Value::Nil)),
-            Value::Str(s) => {
-                let n = as_index(&i)?;
-                Ok(s.chars().nth(n).map(|c| Value::Str(c.to_string())).unwrap_or(Value::Nil))
-            }
-            other => Err(format!("cannot index into {}", other.type_name())),
+            other => Err(format!("[h | t] tail must be a list, got {}", other.type_name())),
         }
     }
 
-    fn eval_unary(&mut self, op: UnOp, e: &Expr, env: &Env) -> Result<Value, String> {
-        let v = self.eval(e, env)?;
+    fn eval_map(&mut self, pairs: &[(Expr, Expr)], env: &Env) -> Result<Value, String> {
+        let mut out: Vec<(Value, Value)> = Vec::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            let key = self.eval(k, env)?;
+            let val = self.eval(v, env)?;
+            if let Some(slot) = out.iter_mut().find(|(ek, _)| values_equal(ek, &key)) {
+                slot.1 = val;
+            } else {
+                out.push((key, val));
+            }
+        }
+        Ok(Value::Map(Rc::new(out)))
+    }
+
+    fn eval_match(&mut self, lhs: &Expr, rhs: &Expr, env: &Env) -> Result<Value, String> {
+        let val = self.eval(rhs, env)?;
+        let pat = expr_to_pattern(lhs.clone())?;
+        if self.match_pattern(&pat, &val, env)? {
+            Ok(val)
+        } else {
+            Err(format!("no match of right-hand side value: {}", val.inspect()))
+        }
+    }
+
+    fn eval_field(&mut self, base: &Expr, field: &str, env: &Env) -> Result<Value, String> {
+        match self.eval(base, env)? {
+            Value::Map(pairs) => Value::map_get(&pairs, &Value::Atom(field.to_string()))
+                .ok_or_else(|| format!("key :{} not found in map", field)),
+            other => Err(format!("cannot access field on a {}", other.type_name())),
+        }
+    }
+
+    fn eval_string(&mut self, parts: &[StrPart], env: &Env) -> Result<Value, String> {
+        let mut s = String::new();
+        for part in parts {
+            match part {
+                StrPart::Lit(t) => s.push_str(t),
+                StrPart::Expr(e) => s.push_str(&self.eval(e, env)?.to_string()),
+            }
+        }
+        Ok(Value::Str(s))
+    }
+
+    fn eval_unary(&mut self, op: UnOp, x: &Expr, env: &Env) -> Result<Value, String> {
+        let v = self.eval(x, env)?;
         match op {
             UnOp::Not => Ok(Value::Bool(!v.truthy())),
             UnOp::Neg => match v {
-                Value::Num(n) => Ok(Value::Num(-n)),
-                other => Err(format!("cannot negate {}", other.type_name())),
+                Value::Int(n) => Ok(Value::Int(-n)),
+                Value::Float(f) => Ok(Value::Float(-f)),
+                other => Err(format!("cannot negate a {}", other.type_name())),
             },
         }
     }
 
     fn eval_binary(&mut self, op: BinOp, l: &Expr, r: &Expr, env: &Env) -> Result<Value, String> {
-        // Short-circuit logical operators.
-        if let BinOp::And = op {
-            let lv = self.eval(l, env)?;
-            return if lv.truthy() { self.eval(r, env) } else { Ok(lv) };
+        // Short-circuiting boolean operators return the deciding operand.
+        match op {
+            BinOp::And => {
+                let lv = self.eval(l, env)?;
+                return if lv.truthy() { self.eval(r, env) } else { Ok(lv) };
+            }
+            BinOp::Or => {
+                let lv = self.eval(l, env)?;
+                return if lv.truthy() { Ok(lv) } else { self.eval(r, env) };
+            }
+            _ => {}
         }
-        if let BinOp::Or = op {
-            let lv = self.eval(l, env)?;
-            return if lv.truthy() { Ok(lv) } else { self.eval(r, env) };
-        }
-
         let lv = self.eval(l, env)?;
         let rv = self.eval(r, env)?;
-        eval_arith(op, lv, rv)
-    }
-
-    fn eval_assign(&mut self, target: &Expr, value: &Expr, env: &Env) -> Result<Value, String> {
-        let val = self.eval(value, env)?;
-        match target {
-            Expr::Ident(name) => {
-                env.borrow_mut().set(name, val.clone());
-                Ok(val)
-            }
-            Expr::IVar(name) => {
-                let inst = self.current_instance(env)?;
-                inst.ivars.borrow_mut().insert(name.clone(), val.clone());
-                Ok(val)
-            }
-            Expr::Index(base, idx) => {
-                let b = self.eval(base, env)?;
-                let i = self.eval(idx, env)?;
-                match b {
-                    Value::Array(a) => {
-                        let n = as_index(&i)?;
-                        let mut vec = a.borrow_mut();
-                        if n < vec.len() {
-                            vec[n] = val.clone();
-                        } else {
-                            return Err(format!("array index {} out of bounds", n));
-                        }
-                    }
-                    Value::Hash(h) => {
-                        h.borrow_mut().insert(i.to_string(), val.clone());
-                    }
-                    other => return Err(format!("cannot assign into {}", other.type_name())),
-                }
-                Ok(val)
-            }
-            _ => Err("invalid assignment target".into()),
-        }
-    }
-
-    fn eval_call(&mut self, callee: &Expr, args: &[Expr], env: &Env) -> Result<Value, String> {
-        let f = self.eval(callee, env)?;
-        let mut argv = Vec::with_capacity(args.len());
-        for a in args {
-            argv.push(self.eval(a, env)?);
-        }
-        self.apply(f, argv)
-    }
-
-    fn apply(&mut self, f: Value, args: Vec<Value>) -> Result<Value, String> {
-        match f {
-            Value::Builtin(_, func) => func(&args),
-            Value::Func(func) => {
-                if args.len() != func.params.len() {
-                    return Err(format!(
-                        "function expects {} args, got {}",
-                        func.params.len(),
-                        args.len()
-                    ));
-                }
-                let call_env = new_env(Some(func.closure.clone()));
-                for (p, a) in func.params.iter().zip(args) {
-                    call_env.borrow_mut().define(p, a);
-                }
-                match self.exec_block(&func.body, &call_env)? {
-                    Flow::Return(v) => Ok(v),
-                    Flow::Normal(v) => Ok(v),
-                }
-            }
-            other => Err(format!("{} is not callable", other.type_name())),
-        }
-    }
-
-    fn eval_method(
-        &mut self,
-        recv: &Expr,
-        name: &str,
-        args: &[Expr],
-        env: &Env,
-    ) -> Result<Value, String> {
-        let target = self.eval(recv, env)?;
-        let mut argv = Vec::with_capacity(args.len());
-        for a in args {
-            argv.push(self.eval(a, env)?);
-        }
-        self.call_method(target, name, argv)
-    }
-
-    // Dispatch a method on any value. Primitives that invoke user
-    // functions/agents are handled here; pure ones fall through to `methods`.
-    fn call_method(&mut self, target: Value, name: &str, argv: Vec<Value>) -> Result<Value, String> {
-        match target {
-            Value::Agent(a) => self.agent_method(&a, name, argv),
-            Value::Subagent(s) => self.subagent_method(&s, name, argv),
-            Value::Tool(t) => self.tool_method(&t, name, argv),
-            Value::Command(c) => self.command_method(&c, name, argv),
-            Value::Graph(g) => self.graph_method(&g, name, argv),
-            Value::Factory(fac) => self.factory_method(&fac, name, argv),
-            Value::Harness(h) => self.harness_method(&h, name, argv),
-            Value::Class(c) => self.class_method(&c, name, argv),
-            Value::Instance(i) => self.instance_method(&i, name, argv),
-            // A capitalized constructor builtin responds to `.new(config)`,
-            // uniform with `Class.new`. `Agent.new(model: "...")` == `Agent { ... }`.
-            Value::Builtin(bname, f) if name == "new" && is_constructor(bname) => {
-                let cfg = argv
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| Value::Hash(Rc::new(RefCell::new(HashMap::new()))));
-                f(&[cfg])
-            }
-            other => crate::methods::dispatch(other, name, argv),
-        }
-    }
-
-    // ---- agent runtime ----
-
-    // Run an agent: before-hooks -> LLM -> after-hooks, producing a Message.
-    fn agent_run(&mut self, agent: &Rc<AgentObj>, input: String) -> Result<Value, String> {
-        let mut text = input;
-        for hook in &agent.before.clone() {
-            let (val, halt) = self.apply_hook(hook, Value::Str(text.clone()))?;
-            if halt {
-                return Ok(make_message(val.to_string(), &agent.name));
-            }
-            text = val.to_string();
-        }
-
-        let content = if agent.tools.is_empty() && agent.memory.is_none() {
-            agent.core.run(&text)?
-        } else {
-            self.run_with_tools(agent, &text)?
-        };
-        let mut msg = make_message(content, &agent.name);
-
-        for hook in &agent.after.clone() {
-            let (val, halt) = self.apply_hook(hook, msg.clone())?;
-            msg = coerce_message(val, &agent.name);
-            if halt {
-                break;
-            }
-        }
-        Ok(msg)
-    }
-
-    // Invoke a hook function, normalizing its return into (payload, halt?).
-    fn apply_hook(&mut self, hook: &Value, arg: Value) -> Result<(Value, bool), String> {
-        let action = match hook {
-            Value::Hook(h) => h.action.clone(),
-            other => other.clone(),
-        };
-        let result = self.apply(action, vec![arg])?;
-        match result {
-            Value::HookResult(r) => Ok((r.value.clone(), r.halt)),
-            other => Ok((other, false)),
-        }
-    }
-
-    // Run an agent that has tools: loop chat completions, executing any tool
-    // calls the model requests and feeding results back until it answers.
-    fn run_with_tools(&mut self, agent: &Rc<AgentObj>, input: &str) -> Result<String, String> {
-        let mut specs = tool_specs(&agent.tools);
-        if agent.memory.is_some() {
-            specs.extend(memory_tool_specs());
-        }
-        let mut messages: Vec<serde_json::Value> = Vec::new();
-        let sys = agent.core.system();
-        if !sys.is_empty() {
-            messages.push(json!({ "role": "system", "content": sys }));
-        }
-        messages.push(json!({ "role": "user", "content": input }));
-
-        for _ in 0..8 {
-            let reply = agent.core.complete(&messages, &specs)?;
-            if reply.tool_calls.is_empty() {
-                return reply
-                    .content
-                    .ok_or_else(|| "no content in OpenAI response".to_string());
-            }
-            let calls: Vec<serde_json::Value> = reply
-                .tool_calls
-                .iter()
-                .map(|c| {
-                    json!({
-                        "id": c.id,
-                        "type": "function",
-                        "function": { "name": c.name, "arguments": c.arguments }
-                    })
-                })
-                .collect();
-            messages.push(json!({
-                "role": "assistant",
-                "content": reply.content,
-                "tool_calls": calls
-            }));
-            for call in &reply.tool_calls {
-                let result = self.invoke_tool(agent, call)?;
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": result
-                }));
-            }
-        }
-        Err("tool loop exceeded 8 rounds".into())
-    }
-
-    fn invoke_tool(&mut self, agent: &Rc<AgentObj>, call: &ToolCall) -> Result<String, String> {
-        let parsed: serde_json::Value =
-            serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
-
-        // Built-in memory tools take precedence over user tools.
-        if let Some(mem) = &agent.memory {
-            let field = |k: &str| parsed.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            match call.name.as_str() {
-                "remember" => {
-                    mem.store.borrow_mut().insert(field("key"), field("value"));
-                    return Ok(format!("remembered '{}'", field("key")));
-                }
-                "recall" => {
-                    let key = field("key");
-                    let store = mem.store.borrow();
-                    if let Some(v) = store.get(&key) {
-                        return Ok(v.clone());
-                    }
-                    // No exact hit — fuzzily match the query against keys and
-                    // values, since a later turn may phrase the key differently.
-                    let q = key.to_lowercase();
-                    let hits: Vec<String> = store
-                        .iter()
-                        .filter(|(k, v)| {
-                            let (kl, vl) = (k.to_lowercase(), v.to_lowercase());
-                            kl.contains(&q) || q.contains(&kl) || vl.contains(&q)
-                        })
-                        .map(|(k, v)| format!("{}: {}", k, v))
-                        .collect();
-                    return Ok(if hits.is_empty() {
-                        format!("nothing remembered for '{}'", key)
-                    } else {
-                        hits.join("; ")
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        let tool = agent
-            .tools
-            .iter()
-            .find(|t| t.name == call.name)
-            .cloned()
-            .ok_or_else(|| format!("model called unknown tool '{}'", call.name))?;
-        // User tools take a single `input` string argument.
-        let input = parsed
-            .get("input")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| call.arguments.clone());
-        let out = self.apply(tool.action.clone(), vec![Value::Str(input)])?;
-        Ok(out.to_string())
-    }
-
-    fn tool_method(
-        &mut self,
-        tool: &Rc<Tool>,
-        name: &str,
-        args: Vec<Value>,
-    ) -> Result<Value, String> {
-        match name {
-            "run" | "call" | "invoke" => self.apply(tool.action.clone(), args),
-            "name" => Ok(Value::Str(tool.name.clone())),
-            "description" => Ok(Value::Str(tool.description.clone())),
-            _ => Err(format!("tool has no method '{}'", name)),
-        }
-    }
-
-    fn agent_method(
-        &mut self,
-        agent: &Rc<AgentObj>,
-        name: &str,
-        args: Vec<Value>,
-    ) -> Result<Value, String> {
-        match name {
-            "run" | "ask" | "invoke" => {
-                let input = args.first().map(|v| v.to_string()).unwrap_or_default();
-                self.agent_run(agent, input)
-            }
-            "use" => {
-                let skill = self.resolve_skill(agent, args.first())?;
-                let input = args.get(1).map(|v| v.to_string()).unwrap_or_default();
-                let composed = format!("{}\n\n{}", skill.instructions, input);
-                self.agent_run(agent, composed)
-            }
-            "delegate" => {
-                let target = args.first().map(|v| v.to_string()).unwrap_or_default();
-                let task = args.get(1).map(|v| v.to_string()).unwrap_or_default();
-                let sub = agent
-                    .subagents
-                    .iter()
-                    .find(|(n, _)| *n == target)
-                    .map(|(_, v)| v.clone())
-                    .ok_or_else(|| format!("agent has no sub-agent '{}'", target))?;
-                match sub {
-                    Value::Agent(a) => self.agent_run(&a, task),
-                    Value::Subagent(s) => match &s.agent {
-                        Value::Agent(a) => self.agent_run(a, task),
-                        _ => Err("subagent has no worker agent".into()),
-                    },
-                    other => Err(format!("sub-agent '{}' is a {}", target, other.type_name())),
-                }
-            }
-            "fan_out" => {
-                let inputs: Vec<String> = match args.first() {
-                    Some(Value::Array(items)) => {
-                        items.borrow().iter().map(|v| v.to_string()).collect()
-                    }
-                    Some(other) => vec![other.to_string()],
-                    None => return Err("fan_out expects a list of inputs".into()),
-                };
-                let results = agent.core.fan_out(inputs)?;
-                let msgs: Vec<Value> = results
-                    .into_iter()
-                    .map(|c| make_message(c, &agent.name))
-                    .collect();
-                Ok(Value::Array(Rc::new(RefCell::new(msgs))))
-            }
-            "memory" => agent
-                .memory
-                .clone()
-                .map(Value::Memory)
-                .ok_or_else(|| "agent has no memory".to_string()),
-            "name" => Ok(Value::Str(agent.name.clone())),
-            "model" => Ok(Value::Str(agent.core.model.clone())),
-            "skills" => {
-                let items: Vec<Value> =
-                    agent.skills.iter().map(|s| Value::Skill(s.clone())).collect();
-                Ok(Value::Array(Rc::new(RefCell::new(items))))
-            }
-            _ => Err(format!("agent has no method '{}'", name)),
-        }
-    }
-
-    fn resolve_skill(
-        &self,
-        agent: &Rc<AgentObj>,
-        arg: Option<&Value>,
-    ) -> Result<Rc<Skill>, String> {
-        match arg {
-            Some(Value::Skill(s)) => Ok(s.clone()),
-            Some(other) => {
-                let wanted = other.to_string();
-                agent
-                    .skills
-                    .iter()
-                    .find(|s| s.name == wanted)
-                    .cloned()
-                    .ok_or_else(|| format!("agent has no skill '{}'", wanted))
-            }
-            None => Err("'use' expects a skill".into()),
-        }
-    }
-
-    fn subagent_method(
-        &mut self,
-        sub: &Rc<crate::value::Subagent>,
-        name: &str,
-        args: Vec<Value>,
-    ) -> Result<Value, String> {
-        match name {
-            "name" => Ok(Value::Str(sub.name.clone())),
-            "description" => Ok(Value::Str(sub.description.clone())),
-            "agent" => Ok(sub.agent.clone()),
-            // Anything else (run, ask, use, ...) delegates to the worker agent.
-            _ => self.call_method(sub.agent.clone(), name, args),
-        }
-    }
-
-    fn command_method(
-        &mut self,
-        cmd: &Rc<Command>,
-        name: &str,
-        args: Vec<Value>,
-    ) -> Result<Value, String> {
-        match name {
-            "run" | "call" | "invoke" => {
-                let input = args.into_iter().next().unwrap_or(Value::Nil);
-                self.apply(cmd.action.clone(), vec![input])
-            }
-            "name" => Ok(Value::Str(cmd.name.clone())),
-            "description" => Ok(Value::Str(cmd.description.clone())),
-            _ => Err(format!("command has no method '{}'", name)),
-        }
-    }
-
-    fn factory_method(
-        &mut self,
-        fac: &Rc<Factory>,
-        name: &str,
-        args: Vec<Value>,
-    ) -> Result<Value, String> {
-        match name {
-            "push" | "enqueue" | "add" => {
-                for a in args {
-                    enqueue(fac, a);
-                }
-                Ok(Value::Num(fac.queue.borrow().len() as f64))
-            }
-            "size" | "length" | "pending" => Ok(Value::Num(fac.queue.borrow().len() as f64)),
-            // Enqueue any args, then drain the whole queue through the worker.
-            "run" | "process" | "drain" | "invoke" => {
-                for a in args {
-                    enqueue(fac, a);
-                }
-                let mut results = Vec::new();
-                loop {
-                    let task = fac.queue.borrow_mut().pop_front();
-                    match task {
-                        Some(t) => results.push(self.run_worker(&fac.agent, t)?),
-                        None => break,
-                    }
-                }
-                Ok(Value::Array(Rc::new(RefCell::new(results))))
-            }
-            _ => Err(format!("factory has no method '{}'", name)),
-        }
-    }
-
-    // Run a factory's worker (an agent, subagent, or class instance) on one task.
-    fn run_worker(&mut self, worker: &Value, task: String) -> Result<Value, String> {
-        match worker {
-            Value::Agent(a) => self.agent_run(a, task),
-            Value::Subagent(s) => match &s.agent {
-                Value::Agent(a) => self.agent_run(a, task),
-                _ => Err("subagent has no worker agent".into()),
+        match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul => arith(op, lv, rv),
+            BinOp::Div => match (num(&lv), num(&rv)) {
+                (Some(_), Some(0.0)) => Err("division by zero".into()),
+                (Some(a), Some(b)) => Ok(Value::Float(a / b)),
+                _ => Err("`/` expects numbers".into()),
             },
-            Value::Instance(i) => {
-                let base = i.base.clone();
-                self.run_worker(&base, task)
+            BinOp::Eq => Ok(Value::Bool(values_equal(&lv, &rv))),
+            BinOp::Neq => Ok(Value::Bool(!values_equal(&lv, &rv))),
+            BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => compare(op, &lv, &rv),
+            BinOp::Concat | BinOp::ListConcat | BinOp::ListDiff => collection_op(op, &lv, &rv),
+            BinOp::And | BinOp::Or => unreachable!(),
+        }
+    }
+
+    // ---- calls ----
+
+    fn local_call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+        let arity = args.len();
+        if let Some(module) = self.current.last().cloned() {
+            if self.has_def(&module, name, arity) {
+                return self.call_user(&module, name, args);
             }
-            other => Err(format!("factory worker is a {}", other.type_name())),
         }
+        if is_kernel(name) {
+            return kernel_call(name, args);
+        }
+        Err(format!("undefined function {}/{}", name, arity))
     }
 
-    // ---- classes and instances ----
-
-    fn class_method(
-        &mut self,
-        class: &Rc<Class>,
-        name: &str,
-        args: Vec<Value>,
-    ) -> Result<Value, String> {
-        match name {
-            "new" => self.class_new(class, args),
-            "name" => Ok(Value::Str(class.name.clone())),
-            _ => Err(format!("class {} has no method '{}'", class.name, name)),
-        }
-    }
-
-    // Build an instance: assemble config down the inheritance chain, construct
-    // the base primitive, then run `init` if defined.
-    fn class_new(&mut self, class: &Rc<Class>, args: Vec<Value>) -> Result<Value, String> {
-        let cfg = self.class_config(class)?;
-        let cfg_val = Value::Hash(Rc::new(RefCell::new(cfg)));
-        let base = self.construct_base(&class.base, cfg_val)?;
-        let inst = Rc::new(crate::value::Instance {
-            class: class.clone(),
-            base,
-            ivars: RefCell::new(HashMap::new()),
-        });
-        if class.find_method("init").is_some() {
-            self.instance_method(&inst, "init", args)?;
-        }
-        Ok(Value::Instance(inst))
-    }
-
-    // Merge `config` results from the root parent down to this class.
-    fn class_config(&mut self, class: &Rc<Class>) -> Result<HashMap<String, Value>, String> {
-        let mut cfg = match &class.parent {
-            Some(p) => self.class_config(p)?,
-            None => HashMap::new(),
-        };
-        if let Some(f) = class.methods.get("config") {
-            match self.apply(Value::Func(f.clone()), vec![])? {
-                Value::Hash(h) => {
-                    for (k, v) in h.borrow().iter() {
-                        cfg.insert(k.clone(), v.clone());
-                    }
-                }
-                other => {
-                    return Err(format!(
-                        "config must return a hash, got {}",
-                        other.type_name()
+    fn remote_call(&mut self, module: &str, fun: &str, args: Vec<Value>) -> Result<Value, String> {
+        match module {
+            "IO" => io_call(fun, args),
+            "Kernel" => kernel_call(fun, args),
+            _ if self.modules.contains_key(module) => {
+                if self.has_def(module, fun, args.len()) {
+                    self.call_user(module, fun, args)
+                } else {
+                    Err(format!(
+                        "function {}.{}/{} is undefined",
+                        module,
+                        fun,
+                        args.len()
                     ))
                 }
             }
-        }
-        Ok(cfg)
-    }
-
-    // Resolve `self` for an @ivar access — only valid inside a method body.
-    fn current_instance(&self, env: &Env) -> Result<Rc<crate::value::Instance>, String> {
-        match env.borrow().get("self") {
-            Some(Value::Instance(i)) => Ok(i),
-            _ => Err("@field used outside of an instance method".into()),
+            _ => Err(format!("module {} is not available", module)),
         }
     }
 
-    fn construct_base(&mut self, kind: &str, cfg: Value) -> Result<Value, String> {
-        crate::builtins::make(kind, cfg)
+    fn has_def(&self, module: &str, name: &str, arity: usize) -> bool {
+        self.modules
+            .get(module)
+            .and_then(|t| t.get(&(name.to_string(), arity)))
+            .is_some()
     }
 
-    fn instance_method(
-        &mut self,
-        inst: &Rc<crate::value::Instance>,
-        name: &str,
-        args: Vec<Value>,
-    ) -> Result<Value, String> {
-        // A method the class defines, mixes in, or inherits wins over the base.
-        if let Some(f) = inst.class.find_method(name) {
-            return self.call_bound(inst, &f, args);
-        }
-        // A `forward`ed method delegates to the named ivar's value.
-        if let Some(ivar) = inst.class.find_forward(name) {
-            let target = inst.ivars.borrow().get(&ivar).cloned().unwrap_or(Value::Nil);
-            return self.call_method(target, name, args);
-        }
-        match name {
-            "base" => Ok(inst.base.clone()),
-            "class" => Ok(Value::Class(inst.class.clone())),
-            // Otherwise behave like the underlying primitive.
-            _ => self.call_method(inst.base.clone(), name, args),
-        }
-    }
-
-    // Call a class method with `self` bound to the instance.
-    fn call_bound(
-        &mut self,
-        inst: &Rc<crate::value::Instance>,
-        f: &Rc<Func>,
-        args: Vec<Value>,
-    ) -> Result<Value, String> {
-        if args.len() != f.params.len() {
-            return Err(format!(
-                "method expects {} args, got {}",
-                f.params.len(),
-                args.len()
-            ));
-        }
-        let call_env = new_env(Some(f.closure.clone()));
-        {
-            let mut e = call_env.borrow_mut();
-            e.define("self", Value::Instance(inst.clone()));
-            for (p, a) in f.params.iter().zip(args) {
-                e.define(p, a);
-            }
-        }
-        match self.exec_block(&f.body, &call_env)? {
-            Flow::Return(v) | Flow::Normal(v) => Ok(v),
-        }
-    }
-
-    // Invoke a harness: apply the charter's rules and before-hooks, run the
-    // agent or graph, then apply the charter's after-hooks.
-    fn harness_method(
-        &mut self,
-        harness: &Rc<Harness>,
-        name: &str,
-        args: Vec<Value>,
-    ) -> Result<Value, String> {
-        match name {
-            "invoke" | "run" | "trigger" => self.harness_invoke(harness, args),
-            "command" => self.charter_lookup(harness, args, true),
-            "skill" => self.charter_lookup(harness, args, false),
-            _ => Err(format!("harness has no method '{}'", name)),
-        }
-    }
-
-    fn harness_invoke(
-        &mut self,
-        harness: &Rc<Harness>,
-        args: Vec<Value>,
-    ) -> Result<Value, String> {
-        let mut text = args.first().map(|v| v.to_string()).unwrap_or_default();
-
-        // The charter's rules become a preamble; its before-hooks run first.
-        if let Some(charter) = &harness.charter {
-            if !charter.rules.is_empty() {
-                let lines: Vec<String> =
-                    charter.rules.iter().map(|r| format!("- {}", r.text)).collect();
-                text = format!("Follow these rules:\n{}\n\n{}", lines.join("\n"), text);
-            }
-            for hook in &charter.before.clone() {
-                let (val, halt) = self.apply_hook(hook, Value::Str(text.clone()))?;
-                if halt {
-                    return Ok(make_message(val.to_string(), "harness"));
-                }
-                text = val.to_string();
-            }
-        }
-
-        // A harness runs its graph; a charter-only harness needs a model,
-        // i.e. it must be combined into an agent to run.
-        let mut result = if let Some(Value::Graph(g)) = &harness.graph {
-            self.graph_method(g, "invoke", vec![Value::Str(text)])?
-        } else {
-            return Err("harness has no graph to run — add a model to make an agent".into());
-        };
-
-        if let Some(charter) = &harness.charter {
-            for hook in &charter.after.clone() {
-                let (val, halt) = self.apply_hook(hook, result.clone())?;
-                result = coerce_message(val, "harness");
-                if halt {
+    fn call_user(&mut self, module: &str, name: &str, args: Vec<Value>) -> Result<Value, String> {
+        let clauses = self
+            .modules
+            .get(module)
+            .and_then(|t| t.get(&(name.to_string(), args.len())))
+            .cloned()
+            .unwrap_or_default();
+        for def in &clauses {
+            let call_env = new_env(Some(self.global.clone()));
+            let mut matched = true;
+            for (pat, arg) in def.params.iter().zip(args.iter()) {
+                if !self.match_pattern(pat, arg, &call_env)? {
+                    matched = false;
                     break;
                 }
             }
+            if !matched {
+                continue;
+            }
+            if let Some(g) = &def.guard {
+                if !self.eval(g, &call_env)?.truthy() {
+                    continue;
+                }
+            }
+            self.current.push(module.to_string());
+            let result = self.eval_block(&def.body, &call_env);
+            self.current.pop();
+            return result;
         }
-        Ok(result)
+        Err(format!(
+            "no function clause matching {}.{}/{}",
+            module,
+            name,
+            args.len()
+        ))
     }
 
-    // harness.command("name") / harness.skill("name") — look up a charter entry.
-    fn charter_lookup(
-        &self,
-        harness: &Rc<Harness>,
-        args: Vec<Value>,
-        command: bool,
-    ) -> Result<Value, String> {
-        let wanted = args.first().map(|v| v.to_string()).unwrap_or_default();
-        let charter = harness
-            .charter
-            .as_ref()
-            .ok_or("harness has no charter")?;
-        if command {
-            charter
-                .commands
-                .iter()
-                .find(|c| c.name == wanted)
-                .map(|c| Value::Command(c.clone()))
-                .ok_or_else(|| format!("charter has no command '{}'", wanted))
-        } else {
-            charter
-                .skills
-                .iter()
-                .find(|s| s.name == wanted)
-                .map(|s| Value::Skill(s.clone()))
-                .ok_or_else(|| format!("charter has no skill '{}'", wanted))
+    // ---- pattern matching ----
+
+    fn match_pattern(&mut self, pat: &Pattern, val: &Value, env: &Env) -> Result<bool, String> {
+        match pat {
+            Pattern::Wildcard => Ok(true),
+            Pattern::Var(name) => {
+                env.borrow_mut().define(name, val.clone());
+                Ok(true)
+            }
+            Pattern::Tuple(pats) => self.match_tuple(pats, val, env),
+            Pattern::List(pats) => self.match_list(pats, val, env),
+            Pattern::Cons(h, t) => self.match_cons(h, t, val, env),
+            Pattern::Map(pairs) => self.match_map(pairs, val, env),
+            scalar => Ok(match_scalar(scalar, val)),
         }
     }
 
-    // Walk a graph from its entry node until an edge resolves to "end".
-    fn graph_method(
+    fn match_tuple(&mut self, pats: &[Pattern], val: &Value, env: &Env) -> Result<bool, String> {
+        match val {
+            Value::Tuple(items) if items.len() == pats.len() => self.match_seq(pats, items, env),
+            _ => Ok(false),
+        }
+    }
+
+    fn match_list(&mut self, pats: &[Pattern], val: &Value, env: &Env) -> Result<bool, String> {
+        match val {
+            Value::List(items) if items.len() == pats.len() => self.match_seq(pats, items, env),
+            _ => Ok(false),
+        }
+    }
+
+    fn match_cons(
         &mut self,
-        graph: &Rc<Graph>,
-        name: &str,
-        args: Vec<Value>,
-    ) -> Result<Value, String> {
-        if !matches!(name, "run" | "invoke" | "trigger") {
-            return Err(format!("graph has no method '{}'", name));
+        h: &Pattern,
+        t: &Pattern,
+        val: &Value,
+        env: &Env,
+    ) -> Result<bool, String> {
+        match val {
+            Value::List(items) if !items.is_empty() => {
+                let tail = Value::list(items[1..].to_vec());
+                Ok(self.match_pattern(h, &items[0], env)? && self.match_pattern(t, &tail, env)?)
+            }
+            _ => Ok(false),
         }
-        let mut current = graph.entry.clone();
-        let mut state = args.into_iter().next().unwrap_or(Value::Nil);
-
-        for _ in 0..graph.max_steps {
-            let node = graph
-                .node(&current)
-                .ok_or_else(|| format!("graph has no node '{}'", current))?
-                .clone();
-            state = match node {
-                Value::Agent(a) => self.agent_run(&a, state.to_string())?,
-                // A node can itself be a subgraph.
-                Value::Graph(sub) => self.graph_method(&sub, "invoke", vec![state])?,
-                callable => self.apply(callable, vec![state])?,
-            };
-            current = match self.next_node(graph, &current, &state)? {
-                Some(next) => next,
-                None => return Ok(state),
-            };
-        }
-        Err(format!("graph exceeded {} steps (cycle?)", graph.max_steps))
     }
 
-    // Resolve the edge out of `from`: a static name, or a router function that
-    // takes the current state and returns the next node name. "end"/nil stops.
-    fn next_node(
+    fn match_map(
         &mut self,
-        graph: &Rc<Graph>,
-        from: &str,
-        state: &Value,
-    ) -> Result<Option<String>, String> {
-        let edge = match graph.edge(from) {
-            Some(e) => e.clone(),
-            None => return Ok(None),
+        pairs: &[(Expr, Pattern)],
+        val: &Value,
+        env: &Env,
+    ) -> Result<bool, String> {
+        let Value::Map(mpairs) = val else {
+            return Ok(false);
         };
-        let target = match edge {
-            Value::Func(_) | Value::Builtin(_, _) => self.apply(edge, vec![state.clone()])?,
-            other => other,
-        };
-        match target {
-            Value::Nil => Ok(None),
-            v => {
-                let s = v.to_string();
-                if s == "end" || s.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(s))
-                }
+        for (kexpr, subpat) in pairs {
+            let key = self.eval(kexpr, env)?;
+            match Value::map_get(mpairs, &key) {
+                Some(v) if self.match_pattern(subpat, &v, env)? => {}
+                _ => return Ok(false),
             }
         }
+        Ok(true)
+    }
+
+    fn match_seq(&mut self, pats: &[Pattern], vals: &[Value], env: &Env) -> Result<bool, String> {
+        for (p, v) in pats.iter().zip(vals.iter()) {
+            if !self.match_pattern(p, v, env)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
-// Build OpenAI function specs for an agent's tools. Each tool takes one
-// string argument named `input`.
-fn tool_specs(tools: &[Rc<Tool>]) -> Vec<serde_json::Value> {
-    tools
-        .iter()
-        .map(|t| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "input": { "type": "string", "description": "input to the tool" }
-                        },
-                        "required": ["input"]
-                    }
-                }
-            })
-        })
-        .collect()
-}
+// ---- numeric helpers ----
 
-// Built-in tool specs an agent with memory exposes to the model.
-fn memory_tool_specs() -> Vec<serde_json::Value> {
-    vec![
-        json!({
-            "type": "function",
-            "function": {
-                "name": "remember",
-                "description": "Save a fact to memory for later. Provide a short key and its value.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "key": { "type": "string", "description": "short identifier" },
-                        "value": { "type": "string", "description": "the fact to store" }
-                    },
-                    "required": ["key", "value"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "recall",
-                "description": "Look up a previously remembered fact by its key.",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "key": { "type": "string", "description": "the key to look up" } },
-                    "required": ["key"]
-                }
-            }
-        }),
-    ]
-}
-
-// The capitalized primitive constructors that respond to `.new`.
-fn is_constructor(name: &str) -> bool {
-    matches!(
-        name,
-        "Model"
-            | "Agent"
-            | "Subagent"
-            | "Tool"
-            | "Memory"
-            | "Rule"
-            | "Skill"
-            | "Hook"
-            | "Command"
-            | "Graph"
-            | "Factory"
-            | "Charter"
-            | "Harness"
-    )
-}
-
-// Enqueue a task or, if given an array, each of its items.
-fn enqueue(fac: &Rc<Factory>, v: Value) {
+fn num(v: &Value) -> Option<f64> {
     match v {
-        Value::Array(a) => {
-            for item in a.borrow().iter() {
-                fac.queue.borrow_mut().push_back(item.to_string());
-            }
-        }
-        other => fac.queue.borrow_mut().push_back(other.to_string()),
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
     }
 }
 
-fn make_message(content: String, from: &str) -> Value {
-    Value::Message(Rc::new(Message {
-        content,
-        role: "assistant".to_string(),
-        from: from.to_string(),
-    }))
-}
-
-// Normalize a hook's return payload into a Message.
-fn coerce_message(v: Value, from: &str) -> Value {
-    match v {
-        Value::Message(_) => v,
-        other => make_message(other.to_string(), from),
+fn arith(op: BinOp, l: Value, r: Value) -> Result<Value, String> {
+    if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
+        return Ok(Value::Int(int_arith(op, *a, *b)));
     }
-}
-
-fn eval_arith(op: BinOp, l: Value, r: Value) -> Result<Value, String> {
-    use BinOp::*;
-    match op {
-        Add => match (&l, &r) {
-            (Value::Num(a), Value::Num(b)) => Ok(Value::Num(a + b)),
-            (Value::Str(_), _) | (_, Value::Str(_)) => {
-                Ok(Value::Str(format!("{}{}", l, r)))
-            }
-            (Value::Array(a), Value::Array(b)) => {
-                let mut v = a.borrow().clone();
-                v.extend(b.borrow().iter().cloned());
-                Ok(Value::Array(Rc::new(RefCell::new(v))))
-            }
-            _ => Err(format!("cannot add {} and {}", l.type_name(), r.type_name())),
-        },
-        Sub | Mul | Div | Mod => {
-            let (a, b) = num_pair(&l, &r)?;
-            Ok(Value::Num(match op {
-                Sub => a - b,
-                Mul => a * b,
-                Div => a / b,
-                Mod => a % b,
-                _ => unreachable!(),
-            }))
-        }
-        Eq => Ok(Value::Bool(values_equal(&l, &r))),
-        Neq => Ok(Value::Bool(!values_equal(&l, &r))),
-        Lt | Gt | Le | Ge => {
-            let (a, b) = num_pair(&l, &r)?;
-            Ok(Value::Bool(match op {
-                Lt => a < b,
-                Gt => a > b,
-                Le => a <= b,
-                Ge => a >= b,
-                _ => unreachable!(),
-            }))
-        }
-        And | Or => unreachable!("handled in eval_binary"),
-    }
-}
-
-fn num_pair(l: &Value, r: &Value) -> Result<(f64, f64), String> {
-    match (l, r) {
-        (Value::Num(a), Value::Num(b)) => Ok((*a, *b)),
+    match (num(&l), num(&r)) {
+        (Some(a), Some(b)) => Ok(Value::Float(float_arith(op, a, b))),
         _ => Err(format!(
-            "expected two numbers, got {} and {}",
+            "arithmetic on {} and {}",
             l.type_name(),
             r.type_name()
         )),
     }
 }
 
-// Compare a `when Type` pattern against a value, ignoring case and underscores
-// so `HookResult`, `hook_result`, and `hookresult` all match.
-fn type_matches(pat: &str, v: &Value) -> bool {
-    let norm = |s: &str| s.to_lowercase().replace('_', "");
-    norm(pat) == norm(v.type_name())
+fn int_arith(op: BinOp, a: i64, b: i64) -> i64 {
+    match op {
+        BinOp::Add => a + b,
+        BinOp::Sub => a - b,
+        BinOp::Mul => a * b,
+        _ => unreachable!(),
+    }
 }
 
-fn values_equal(l: &Value, r: &Value) -> bool {
-    match (l, r) {
-        (Value::Nil, Value::Nil) => true,
-        (Value::Bool(a), Value::Bool(b)) => a == b,
-        (Value::Num(a), Value::Num(b)) => a == b,
-        (Value::Str(a), Value::Str(b)) => a == b,
+fn float_arith(op: BinOp, a: f64, b: f64) -> f64 {
+    match op {
+        BinOp::Add => a + b,
+        BinOp::Sub => a - b,
+        BinOp::Mul => a * b,
+        _ => unreachable!(),
+    }
+}
+
+// `<>` on strings, `++`/`--` on lists.
+fn collection_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
+    match (op, l, r) {
+        (BinOp::Concat, Value::Str(a), Value::Str(b)) => Ok(Value::Str(format!("{}{}", a, b))),
+        (BinOp::Concat, _, _) => Err("`<>` expects strings".into()),
+        (BinOp::ListConcat, Value::List(a), Value::List(b)) => {
+            let mut v = (**a).clone();
+            v.extend(b.iter().cloned());
+            Ok(Value::list(v))
+        }
+        (BinOp::ListConcat, _, _) => Err("`++` expects lists".into()),
+        (BinOp::ListDiff, Value::List(a), Value::List(b)) => {
+            let kept: Vec<Value> = a
+                .iter()
+                .filter(|x| !b.iter().any(|y| values_equal(x, y)))
+                .cloned()
+                .collect();
+            Ok(Value::list(kept))
+        }
+        _ => Err("`--` expects lists".into()),
+    }
+}
+
+fn compare(op: BinOp, l: &Value, r: &Value) -> Result<Value, String> {
+    let ord = match (num(l), num(r)) {
+        (Some(a), Some(b)) => a.partial_cmp(&b),
+        _ => match (l, r) {
+            (Value::Str(a), Value::Str(b)) => Some(a.cmp(b)),
+            (Value::Atom(a), Value::Atom(b)) => Some(a.cmp(b)),
+            _ => None,
+        },
+    };
+    let ord = ord.ok_or_else(|| {
+        format!("cannot compare {} and {}", l.type_name(), r.type_name())
+    })?;
+    use std::cmp::Ordering::*;
+    let result = match op {
+        BinOp::Lt => ord == Less,
+        BinOp::Gt => ord == Greater,
+        BinOp::Le => ord != Greater,
+        BinOp::Ge => ord != Less,
+        _ => unreachable!(),
+    };
+    Ok(Value::Bool(result))
+}
+
+// ---- native modules ----
+
+fn io_call(fun: &str, args: Vec<Value>) -> Result<Value, String> {
+    match (fun, args.as_slice()) {
+        ("puts", [v]) => {
+            println!("{}", v);
+            Ok(Value::Atom("ok".into()))
+        }
+        ("puts", []) => {
+            println!();
+            Ok(Value::Atom("ok".into()))
+        }
+        ("inspect", [v]) => {
+            println!("{}", v.inspect());
+            Ok(v.clone())
+        }
+        _ => Err(format!("IO.{}/{} is undefined", fun, args.len())),
+    }
+}
+
+fn is_kernel(name: &str) -> bool {
+    matches!(
+        name,
+        "div" | "rem" | "to_string" | "length" | "hd" | "tl" | "elem" | "tuple_size"
+            | "map_size" | "is_nil" | "is_integer" | "is_float" | "is_number" | "is_atom"
+            | "is_boolean" | "is_list" | "is_map" | "is_tuple" | "is_binary" | "is_function"
+            | "abs" | "not"
+    )
+}
+
+fn kernel_call(name: &str, args: Vec<Value>) -> Result<Value, String> {
+    match (name, args.as_slice()) {
+        ("div", [Value::Int(a), Value::Int(b)]) => {
+            if *b == 0 {
+                Err("division by zero".into())
+            } else {
+                Ok(Value::Int(a / b))
+            }
+        }
+        ("rem", [Value::Int(a), Value::Int(b)]) => {
+            if *b == 0 {
+                Err("division by zero".into())
+            } else {
+                Ok(Value::Int(a % b))
+            }
+        }
+        ("to_string", [v]) => Ok(Value::Str(v.to_string())),
+        ("length", [Value::List(l)]) => Ok(Value::Int(l.len() as i64)),
+        ("hd", [Value::List(l)]) => l.first().cloned().ok_or_else(|| "hd of empty list".into()),
+        ("tl", [Value::List(l)]) => {
+            if l.is_empty() {
+                Err("tl of empty list".into())
+            } else {
+                Ok(Value::list(l[1..].to_vec()))
+            }
+        }
+        ("elem", [Value::Tuple(t), Value::Int(i)]) => t
+            .get(*i as usize)
+            .cloned()
+            .ok_or_else(|| "elem index out of range".into()),
+        ("tuple_size", [Value::Tuple(t)]) => Ok(Value::Int(t.len() as i64)),
+        ("map_size", [Value::Map(m)]) => Ok(Value::Int(m.len() as i64)),
+        ("abs", [Value::Int(n)]) => Ok(Value::Int(n.abs())),
+        ("abs", [Value::Float(f)]) => Ok(Value::Float(f.abs())),
+        ("not", [v]) => Ok(Value::Bool(!v.truthy())),
+        (pred, [v]) if pred.starts_with("is_") => Ok(Value::Bool(type_pred(pred, v))),
+        _ => Err(format!("Kernel.{}/{} is undefined", name, args.len())),
+    }
+}
+
+// Literal / scalar patterns match by equality with the corresponding value.
+fn match_scalar(pat: &Pattern, val: &Value) -> bool {
+    match pat {
+        Pattern::Int(n) => matches!(val, Value::Int(m) if m == n),
+        Pattern::Float(f) => matches!(val, Value::Float(g) if g == f),
+        Pattern::Atom(a) => matches!(val, Value::Atom(b) if b == a),
+        Pattern::Bool(b) => matches!(val, Value::Bool(c) if c == b),
+        Pattern::Nil => matches!(val, Value::Nil),
+        Pattern::Str(s) => matches!(val, Value::Str(t) if t == s),
         _ => false,
     }
 }
 
-fn as_index(v: &Value) -> Result<usize, String> {
-    match v {
-        Value::Num(n) if *n >= 0.0 => Ok(*n as usize),
-        _ => Err(format!("invalid index {}", v)),
+fn type_pred(pred: &str, v: &Value) -> bool {
+    match pred {
+        "is_nil" => matches!(v, Value::Nil),
+        "is_integer" => matches!(v, Value::Int(_)),
+        "is_float" => matches!(v, Value::Float(_)),
+        "is_number" => matches!(v, Value::Int(_) | Value::Float(_)),
+        "is_atom" => matches!(v, Value::Atom(_) | Value::Bool(_) | Value::Nil),
+        "is_boolean" => matches!(v, Value::Bool(_)),
+        "is_list" => matches!(v, Value::List(_)),
+        "is_map" => matches!(v, Value::Map(_)),
+        "is_tuple" => matches!(v, Value::Tuple(_)),
+        "is_binary" => matches!(v, Value::Str(_)),
+        "is_function" => matches!(v, Value::Fun(_)),
+        _ => false,
     }
-}
-
-fn install_env_hash(env: &Env) {
-    let mut map = HashMap::new();
-    for (k, v) in std::env::vars() {
-        map.insert(k, Value::Str(v));
-    }
-    env.borrow_mut()
-        .define("env", Value::Hash(Rc::new(RefCell::new(map))));
 }

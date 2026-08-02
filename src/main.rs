@@ -1,8 +1,9 @@
+// openai is unused until phase 4 (AI primitives); keep it compiling meanwhile.
+#![allow(dead_code, unused_imports)]
+
 mod ast;
-mod builtins;
 mod interp;
 mod lexer;
-mod methods;
 mod openai;
 mod parser;
 mod token;
