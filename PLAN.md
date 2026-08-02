@@ -158,6 +158,94 @@ and directly requested.
 - `for x <- list, filter, do: expr` — phase 5.
 - Sigils (`~s`, `~w`) — later / optional.
 
+## 3bis. Type system (pillar)
+
+Rust-influenced **static typing in Elixir clothing**: types are inferred
+everywhere, **every definition declares its signature**, and union types are
+first-class. Kept minimal — only what the foundation and agent/network work
+need. Runs as a checker pass after parse, before eval (untyped eval unchanged).
+
+### Types
+
+```
+integer | float | number | boolean | atom | string | nil
+list(t) | {t1, t2, ...} (tuple) | map | %{key: t} | fun(a, b -> c)
+t1 | t2            # union
+:ok | :error       # atom literals as singleton types
+{:ok, t} | {:error, e}   # Result
+t | nil                  # Option (nil kept, Elixir-consistent)
+dynamic            # escape hatch for interop the checker can't see (network)
+a, b, ...          # lowercase = type variables (parametric signatures)
+```
+
+### Declared definitions (mandatory)
+
+Signatures are required on every `def`/`defp` using Elixir's `::` operator,
+inline on params and return:
+
+```elixir
+def add(a :: integer, b :: integer) :: integer do
+  a + b
+end
+
+def fetch(m :: map, k :: atom) :: {:ok, dynamic} | {:error, atom} do
+  ...
+end
+```
+
+- **Params and return type are required** (this is the "definitions always
+  declare them" rule). The checker verifies the body's inferred type is
+  assignable to the declared return, and that call sites pass assignable args.
+- **Everything else is inferred**: locals, literals, `case`/`if` results,
+  anonymous functions.
+- **Union assignability**: `t` → `t1 | t2` if `t` fits either; `t1 | t2` → `u`
+  if both fit. `dynamic` is assignable both ways (gradual boundary).
+- **Type variables**: lowercase names in a signature unify, giving parametric
+  functions (`Enum.map(list(a), fun(a -> b)) :: list(b)`) without full generics.
+
+### User types & decorating primitives (priority)
+
+The headline use case: **decorate core agentic primitives** — wrap an `Agent`
+(or `Tool`, `Graph`, …) to add or override behavior while it still works
+everywhere the primitive works. The Elixir idiom, and ours:
+
+- **`defstruct`** defines a user type that embeds a primitive plus extra state.
+- The type's **module** adds/overrides functions, delegating to the inner
+  primitive for the rest.
+- A minimal **protocol** (`defprotocol`/`defimpl`) — the agentic interface,
+  e.g. `Runnable.run(x, input)` — lets a decorated struct satisfy the same
+  interface and be dropped into any slot that expects the primitive (graph
+  node, factory worker, pipeline stage). This is the polymorphism decoration
+  needs; kept to the single interface the primitives share.
+
+```elixir
+defmodule Logged do
+  defstruct [:inner :: dynamic]
+  # decorate: same interface, extra behavior, delegates the rest
+  def run(%Logged{inner: a} :: Logged, input :: string) :: {:ok, dynamic} | {:error, atom} do
+    IO.puts("→ #{input}")
+    Allegro.Agent.run(input, a)
+  end
+end
+
+logged = %Logged{inner: Allegro.Agent.new(system: "…")}
+"hello" |> Logged.run(logged)     # works anywhere an agent runner is expected
+```
+
+### Scope discipline
+
+Monomorphic + gradual: no full Hindley-Milner, no typeclasses, no recursive
+user type aliases beyond a simple `@type` (optional, late). **Protocols are
+limited to the shared agentic interface**, not a general typeclass system.
+`dynamic` covers what inference can't reach so the checker never blocks work.
+
+## 3ter. Memory management
+
+**Automatic, already.** Values are `Rc`-counted and freed when the last
+reference drops — users never manage memory. The immutable functional value
+model does not form reference cycles in normal use, so refcounting suffices; a
+cycle collector is a later concern only if mutable cyclic structures appear.
+
 ## 4. Standard library & namespaces
 
 ### 4.1 Module system
@@ -279,35 +367,46 @@ A small `Config` module centralizes env lookup: `Config.fetch(:model, default)`.
 
 ## 7. Phases & acceptance criteria
 
-**Phase 1 — Core functional core.**
-Lexer/parser/AST/values for: integers, floats, atoms, booleans/nil, strings +
-interpolation, lists, tuples, maps, keyword lists; `=` match (vars, `_`,
-literals, tuple/list/map destructure); `defmodule` + single-clause `def`;
-qualified calls; `Kernel` + `IO.puts`; arithmetic/comparison/boolean; pipe.
-*Verify:* a script that builds data, pipes through a couple user functions, and
-prints — correct output.
+**Phase 1 — Core functional core. ✅ DONE.**
+Values (int/float/atom/bool/nil/string+`#{}`/list/tuple/map/keyword),
+`defmodule` + multi-clause `def` + guards + arity, `=` match with
+tuple/list/`[h|t]`/map destructure, qualified + local calls, `Kernel`/`IO`,
+arithmetic (`/` vs div/rem), comparison, `<>`/`++`/`--`, boolean, `if`, pipe.
+*Verified:* the phase-1 script runs; multi-clause/guards/`if` work.
 
-**Phase 2 — Pattern matching & control flow.**
-Multi-clause functions, `when` guards, `case`, `cond`, `if/unless`, `with`,
-`[h|t]` and map/struct destructure, anonymous `fn` (+ `.()` call), capture `&`.
-*Verify:* recursive `sum([h|t])`, `case` on `{:ok,_}/{:error,_}`, a `with`
-chain.
+**Phase 2 — Control flow & anonymous functions.**
+`case`, `cond`, `with`, `unless`, `fn` + `.()` call, `&`/`&1` capture, pin `^`.
+(Multi-clause defs & guards already landed in phase 1.)
+*Verify:* `case` on `{:ok,_}/{:error,_}`, a `with` chain, `fn` passed and called.
 
-**Phase 3 — Std data lib & structs.**
-`defstruct`; `Enum`, `String`, `Map`, `List`, `Integer`, `IO`; `alias`/`import`.
-*Verify:* `[1,2,3] |> Enum.map(&(&1*&1)) |> Enum.sum()`; a struct round-trip.
+**Phase 3 — Type system (pillar).**
+`::` signatures **required** on every `def`/`defp`; a `Type` model with base
+types, `list(t)`, tuple/map/fun types, **unions**, atom-literal singletons,
+type variables, and `dynamic`; a checker pass (infer bodies, verify declared
+returns, check call args, union assignability). Result/Option types.
+*Verify:* a typed module type-checks; an argument/return mismatch is rejected
+with a clear error; a parametric signature unifies.
 
-**Phase 4 — AI primitives as std lib.**
-Structs + modules for all primitives, wired to `openai.rs`; env-default config;
-result tuples + bang variants; pipe composition; tool loop; memory;
-graph routing; delegation; fan_out.
-*Verify:* rebuilt equivalents of today's three examples run against OpenAI.
+**Phase 4 — Structs, protocols & data std lib.**
+`defstruct` (typed user types), the `Runnable` **protocol** for decoration
+(`defprotocol`/`defimpl`, dispatch on struct tag); `Enum`, `String`, `Map`,
+`List`, `Integer`, `IO`; `alias`/`import`. Typed signatures throughout.
+*Verify:* `[1,2,3] |> Enum.map(fn x -> x*x end) |> Enum.sum()`; a decorated
+struct satisfies `Runnable` and is used where the base type is expected.
 
-**Phase 5 — Ergonomics & docs.**
-`*rest` variadic, `for` comprehensions, sigils (optional), finalized
-`{:ok,_}` conventions, `README.md`, and **a 25-file tutorial** in `examples/` of
-growing complexity — each a standalone, runnable `.al` (01 basics → 25 full
-multi-agent composition).
+**Phase 5 — AI primitives as std lib.**
+Structs + modules for all primitives (`Allegro.*`, default-aliased), wired to
+`openai.rs`; env-default inline config; `{:ok,_}`/`{:error,_}` + bang variants;
+pipe composition; tool loop; memory; graph routing; delegation; fan_out;
+**decoration** of `Agent`/`Tool`/`Graph` via structs + the `Runnable` protocol.
+*Verify:* rebuilt equivalents of today's examples run against OpenAI; a
+decorated agent runs in a graph node.
+
+**Phase 6 — Ergonomics, docs & tutorial.**
+`*rest` variadic, `for` comprehensions, sigils (optional), `@type` aliases
+(optional), `README.md`, and **a 25-file tutorial** in `examples/` of growing
+complexity — each a standalone, runnable `.al` (01 basics → 25 full multi-agent
+composition with decoration).
 *Verify:* every one of the 25 examples runs.
 
 ## 8. Decisions (LOCKED)
@@ -326,6 +425,14 @@ multi-agent composition).
   raise. Drives `case`/`with`.
 - **D5 Variadic — `*rest` EXTENSION.** Trailing rest parameter collects
   remaining args into a list (allegro extension over Elixir).
+- **D6 Types — STATIC, DECLARED-ON-DEFS, INFERRED ELSEWHERE.** `::` signatures
+  required on every def; union types; type variables; `dynamic` gradual escape.
+  Monomorphic + gradual, no full HM. Checker pass before eval.
+- **D7 nil KEPT.** Elixir-consistent. Option = `t | nil`; Result =
+  `{:ok, t} | {:error, e}` (Rust semantics, Elixir clothing).
+- **D8 Decoration — STRUCTS + ONE PROTOCOL.** User types via `defstruct` +
+  module; a single `Runnable` protocol lets decorated primitives satisfy the
+  shared agentic interface. No general typeclass system.
 
 ## 9. Risks
 
