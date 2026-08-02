@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::ast::{BinOp, Expr, Pattern, Stmt, UnOp};
@@ -7,6 +7,7 @@ use crate::builtins;
 use serde_json::json;
 
 use crate::openai::ToolCall;
+use crate::scheduler::{Handler, Proc};
 use crate::value::{
     new_env, AgentObj, Class, Command, Env, Factory, Func, Graph, Harness, Message, Skill, Tool,
     Value,
@@ -20,6 +21,12 @@ enum Flow {
 
 pub struct Interp {
     pub global: Env,
+    pub(crate) procs: HashMap<u64, Proc>,
+    pub(crate) run_queue: VecDeque<u64>,
+    pub(crate) registry: HashMap<String, u64>,
+    pub(crate) next_pid: u64,
+    pub(crate) current_pid: u64,
+    pub(crate) next_ref: u64,
 }
 
 impl Interp {
@@ -27,7 +34,27 @@ impl Interp {
         let global = new_env(None);
         builtins::register(&global);
         install_env_hash(&global);
-        Interp { global }
+        let mut procs = HashMap::new();
+        // pid 0 is the top-level flow.
+        procs.insert(
+            0,
+            Proc {
+                mailbox: VecDeque::new(),
+                state: Value::Nil,
+                handler: Handler::Main,
+                monitors: Vec::new(),
+                alive: true,
+            },
+        );
+        Interp {
+            global,
+            procs,
+            run_queue: VecDeque::new(),
+            registry: HashMap::new(),
+            next_pid: 1,
+            current_pid: 0,
+            next_ref: 1,
+        }
     }
 
     pub fn run(&mut self, program: &[Stmt]) -> Result<(), String> {
@@ -381,9 +408,11 @@ impl Interp {
         self.apply(f, argv)
     }
 
-    fn apply(&mut self, f: Value, args: Vec<Value>) -> Result<Value, String> {
+    pub(crate) fn apply(&mut self, f: Value, args: Vec<Value>) -> Result<Value, String> {
         match f {
-            Value::Builtin(_, func) => func(&args),
+            // Scheduler builtins need interpreter state, so the process runtime
+            // dispatches them; a non-scheduler name falls back to the plain fn.
+            Value::Builtin(name, func) => self.sched_builtin(name, &args)?.map_or_else(|| func(&args), Ok),
             Value::Func(func) => {
                 if args.len() != func.params.len() {
                     return Err(format!(
@@ -433,6 +462,10 @@ impl Interp {
             Value::Harness(h) => self.harness_method(&h, name, argv),
             Value::Class(c) => self.class_method(&c, name, argv),
             Value::Instance(i) => self.instance_method(&i, name, argv),
+            Value::Pid(id) => self.pid_method(id, name, argv),
+            // The OTP object primitives (Registry/Supervisor/Task) dispatch their
+            // methods through the process runtime.
+            Value::Builtin(b, _) if crate::scheduler::is_otp_object(b) => self.otp_object_method(b, name, argv),
             // A capitalized constructor builtin responds to `.new(config)`,
             // uniform with `Class.new`. `Agent.new(model: "...")` == `Agent { ... }`.
             Value::Builtin(bname, f) if name == "new" && is_constructor(bname) => {
@@ -782,6 +815,11 @@ impl Interp {
         name: &str,
         args: Vec<Value>,
     ) -> Result<Value, String> {
+        // GenServer subclasses build a live process (start/child); other names
+        // fall through to the normal class dispatch.
+        if let Some(r) = self.genserver_dispatch(class, name, &args) {
+            return r;
+        }
         match name {
             "new" => self.class_new(class, args),
             "name" => Ok(Value::Str(class.name.clone())),
@@ -842,7 +880,7 @@ impl Interp {
         crate::builtins::make(kind, cfg)
     }
 
-    fn instance_method(
+    pub(crate) fn instance_method(
         &mut self,
         inst: &Rc<crate::value::Instance>,
         name: &str,
@@ -1098,6 +1136,7 @@ fn memory_tool_specs() -> Vec<serde_json::Value> {
         }),
     ]
 }
+
 
 // The capitalized primitive constructors that respond to `.new`.
 fn is_constructor(name: &str) -> bool {

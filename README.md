@@ -1,8 +1,9 @@
 # allegro
 
 A small Ruby-like language for composing **agents, harnesses, graphs, and
-runner queues**. Primitives are classes: build with `.new`, subclass for reuse,
-mix in modules for shared behavior, then invoke.
+runner queues** on an **OTP-style process runtime** (GenServers, supervisors,
+green-threaded message passing). Primitives are classes: build with `.new`,
+subclass for reuse, mix in modules for shared behavior, then invoke.
 
 ```ruby
 bot = Agent.new(system: "You are terse.")   # model defaults from the MODEL env var
@@ -223,6 +224,84 @@ end
 runner.run(["d", "e"]) # enqueue inline, then drain
 ```
 
+## Processes & OTP
+
+Underneath the agentic primitives is an **actor runtime**: lightweight processes
+scheduled on **green threads** — cooperative and in-process. This is concurrency
+(interleaved logical parallelism), not multiple CPU cores. It is how you build
+**parallel, distributed-style** agent graphs: independent workers passing
+messages, addressed by name, supervised and restarted on failure.
+
+A process is `state + a handler`. `send`/`cast` enqueue and return immediately;
+`receive`/`call`/`await` (and `drain()`) pump the scheduler until it is idle.
+
+| Primitive     | Build / start | Invoke with |
+|---------------|---------------|-------------|
+| bare process  | `spawn(def (state, msg) … end, state)` | `send` · `pid.send` |
+| `GenServer`   | `class X < GenServer` → `X.start(init)` | `.cast` `.call` `.stop` `.alive?` |
+| `Supervisor`  | `Supervisor.start(children: [X.child(a)])` | `.which_children` |
+| `Registry`    | `Registry.register(pid, name)` | `Registry.whereis(name)` |
+| `Task`        | `Task.async(fn)` · `Task.parallel([fns])` | `Task.await(pid)` |
+
+Free functions: `spawn` · `send(target, msg)` · `receive()` · `pid()` (current
+process) · `monitor(pid)` · `drain()` · `raise(reason)` · `reply(value, state)`.
+`send` and `monitor` take a pid **or** a registered name. A **`Pid`** is a value.
+
+### Actors, the registry, and receive
+
+```ruby
+echo = spawn(def (state, msg)
+  send(msg.get("from"), "echo: " + msg.get("text"))
+  return state                       # handler returns the next state
+end, nil)
+
+Registry.register(echo, "echo")      # bind a name to the pid
+send("echo", { from: pid(), text: "hi" })
+puts receive()                       # echo: hi   (receive pumps the scheduler)
+```
+
+### GenServer
+
+A stateful server with a Ruby class shape. `init` returns the starting state,
+`handle_cast` handles fire-and-forget messages (returns the new state), and
+`handle_call` handles request/reply with `reply(value, new_state)`.
+
+```ruby
+class Counter < GenServer
+  def init(n)     return n end
+  def handle_cast(msg, state)  return state + 1 end
+  def handle_call(msg, state)  return reply(state, state) end
+end
+
+c = Counter.start(0)
+c.cast("inc")
+c.call("get")     # 1
+```
+
+### Supervision
+
+`raise` crashes only the current process. `monitor(pid)` delivers a
+`{ down: true, pid:, reason: }` message when a process dies. A `Supervisor`
+watches its children and restarts a crashed one (any reason but `"normal"`),
+re-running its `child` spec so it recovers with fresh state.
+
+```ruby
+sup = Supervisor.start({ children: [ Worker.child(42) ] })
+worker = sup.which_children.first
+worker.cast("crash")     # raises inside the worker
+drain()                  # let the crash + restart run
+sup.which_children.first # a new, healthy worker
+```
+
+### Task — green-thread fan-out
+
+```ruby
+results = Task.parallel([
+  def () return worker.run("a").content end,
+  def () return worker.run("b").content end
+])                       # runs on green threads, joined in input order
+```
+
 ## Custom workflows: classes, inheritance & composition
 
 Primitives are classes, so higher-level abstractions are ordinary allegro
@@ -311,12 +390,17 @@ Primitives produce structured values, not bare strings:
   Prints as its content, so `puts msg` shows the text.
 - **`HookResult`** — a hook's result: `.value`, `.halt?`. Built with `halt(v)` (stop) or
   `keep(v)` (continue).
+- **`Pid`** — a live process. `.send` `.cast` `.call` `.stop` `.alive?` `.id`. Returned
+  by `spawn`, `X.start`, `Supervisor.start`, `Task.async`, and `pid()`.
 
 ## Built-in functions
 
 `puts` · `print` · `str` · `num` · `len` · `range(n)` / `range(a, b)` · `type_of(x)` ·
 `fan_out(agent, list)` · `pipeline(input, agent, agent, …)` · `halt(v)` · `keep(v)` ·
 `message(content, from)`
+
+Process model: `spawn(fn, state)` · `send(target, msg)` · `receive()` · `pid()` ·
+`monitor(pid)` · `drain()` · `raise(reason)` · `reply(value, state)`
 
 `env` is a hash of environment variables: `env.MODEL`, `env["OPENAI_API_KEY"]`.
 
@@ -328,6 +412,21 @@ Primitives produce structured values, not bare strings:
 - **number**: `round` `floor` `ceil` `to_s`
 
 ## Examples
+
+A guided progression, **basics → OTP → agentic → agentic + OTP**. Tiers 1–2 run
+offline; the agentic tiers need `OPENAI_API_KEY`.
+
+Basics — `01_hello` · `02_values` · `03_collections` · `04_control_flow` · `05_functions`
+
+OTP — `06_processes` · `07_registry` · `08_genserver` · `09_supervisor` · `10_parallel`
+
+Agentic — `11_agent` · `12_tools_memory` · `13_subagents` · `14_harness`
+
+Agentic + OTP — `15_agent_pool` (parallel agent calls) · `16_supervised_agents`
+(an Agent wrapped in a supervised GenServer) · `17_process_graph` (a pipeline of
+agent processes addressed by name)
+
+Fuller standalone demos:
 
 - `examples/agents.al` — a worker class run through a Factory queue + fan-out
 - `examples/harness.al` — Charter → Harness → Agent, hooks, graph, pattern matching

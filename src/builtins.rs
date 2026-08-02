@@ -25,6 +25,22 @@ pub fn register(env: &Env) {
     e.define("halt", Value::Builtin("halt", b_halt));
     e.define("keep", Value::Builtin("keep", b_keep));
     e.define("message", Value::Builtin("message", b_message));
+    // OTP process model. spawn/send/receive/monitor/pid need scheduler state,
+    // so the interpreter intercepts them by name; these entries just make the
+    // names resolvable. `reply` is pure. Registry/Supervisor/Task/GenServer are
+    // objects whose methods the interpreter dispatches.
+    e.define("spawn", Value::Builtin("spawn", b_sched_stub));
+    e.define("send", Value::Builtin("send", b_sched_stub));
+    e.define("receive", Value::Builtin("receive", b_sched_stub));
+    e.define("monitor", Value::Builtin("monitor", b_sched_stub));
+    e.define("pid", Value::Builtin("pid", b_sched_stub));
+    e.define("drain", Value::Builtin("drain", b_sched_stub));
+    e.define("reply", Value::Builtin("reply", b_reply));
+    e.define("raise", Value::Builtin("raise", b_raise));
+    e.define("Registry", Value::Builtin("Registry", b_sched_stub));
+    e.define("Supervisor", Value::Builtin("Supervisor", b_sched_stub));
+    e.define("Task", Value::Builtin("Task", b_sched_stub));
+    e.define("GenServer", Value::Builtin("GenServer", b_sched_stub));
     // primitive constructors — capitalized because we are constructing them
     e.define("Model", Value::Builtin("Model", b_model));
     e.define("Agent", Value::Builtin("Agent", b_agent));
@@ -476,6 +492,29 @@ fn b_message(args: &[Value]) -> Result<Value, String> {
         role: "user".to_string(),
         from,
     })))
+}
+
+// Placeholder for scheduler/OTP names that the interpreter intercepts. Only
+// reached if one is called in a context the interpreter did not route.
+fn b_sched_stub(_args: &[Value]) -> Result<Value, String> {
+    Err("this is a process-model primitive; call it through the scheduler".into())
+}
+
+// raise(reason) — crash the current process (or abort the program at top level)
+// with `reason`. In a process the crash is isolated; monitors get a DOWN.
+fn b_raise(args: &[Value]) -> Result<Value, String> {
+    Err(args.first().map(|v| v.to_string()).unwrap_or_else(|| "raised".into()))
+}
+
+// reply(value, new_state) — a GenServer's handle_call return: the value to send
+// back to the caller plus the server's next state.
+fn b_reply(args: &[Value]) -> Result<Value, String> {
+    let value = args.first().cloned().unwrap_or(Value::Nil);
+    let state = args.get(1).cloned().unwrap_or(Value::Nil);
+    let mut h = HashMap::new();
+    h.insert("__reply__".to_string(), value);
+    h.insert("__state__".to_string(), state);
+    Ok(Value::Hash(Rc::new(RefCell::new(h))))
 }
 
 fn b_type_of(args: &[Value]) -> Result<Value, String> {

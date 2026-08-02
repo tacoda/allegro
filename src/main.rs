@@ -5,6 +5,7 @@ mod lexer;
 mod methods;
 mod openai;
 mod parser;
+mod scheduler;
 mod token;
 mod value;
 

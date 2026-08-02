@@ -40,6 +40,8 @@ pub enum Value {
     // Callables
     Func(Rc<Func>),
     Builtin(&'static str, BuiltinFn),
+    // A live process, addressed by id. Backed by the interpreter's scheduler.
+    Pid(u64),
 }
 
 pub struct Func {
@@ -260,6 +262,7 @@ impl Value {
             Value::HookResult(_) => "hook_result",
             Value::Func(_) => "function",
             Value::Builtin(_, _) => "builtin",
+            Value::Pid(_) => "pid",
         }
     }
 
@@ -331,6 +334,7 @@ impl fmt::Display for Value {
             Value::HookResult(r) => write!(f, "{}", r.value),
             Value::Func(_) => write!(f, "#<function>"),
             Value::Builtin(n, _) => write!(f, "#<builtin {}>", n),
+            Value::Pid(id) => write!(f, "#<pid {}>", id),
         }
     }
 }
