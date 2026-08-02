@@ -19,10 +19,13 @@ pub enum Value {
     Fun(Rc<Fun>),
 }
 
-// An anonymous function: clauses tried in order, closing over its definition env.
+// An anonymous function: clauses tried in order, closing over its definition
+// env and the module it was defined in (so unqualified calls in its body
+// resolve lexically, not against whatever module later invokes it).
 pub struct Fun {
     pub clauses: Vec<FnClause>,
     pub closure: Env,
+    pub module: Option<String>,
 }
 
 impl Value {

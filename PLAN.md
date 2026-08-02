@@ -5,8 +5,14 @@
 
 ## 1. Goal & non-goals
 
+**Tagline: Presto is a language to easily build agent harnesses.**
+
+**File convention.** A program/example is mostly *definitions* (`defmodule`s),
+with a **single invoke line at the bottom** to run it standalone (e.g.
+`Main.run()`).
+
 **Goal.** Replace the Ruby-flavored object model with an **Elixir-flavored
-functional** language for composing AI agents. Same job as before (build
+functional** language for composing AI agents into harnesses. Same job as before (build
 agents/tools/graphs backed by OpenAI, driven by env tokens), but the paradigm
 is functional: data flows through pure-ish functions composed with the pipe
 operator, primitives are **standard-library modules + structs**, and behavior is
@@ -367,14 +373,30 @@ sort_by/member?), `String`, `Map` (fetch→`{:ok,_}`/`:error`), `List`, `Integer
 trip; `*rest`. (`alias`/`import` deferred to phase 4 where `Allegro.*` aliasing
 matters.)
 
-**Phase 4 — AI primitives + supervision.**
-Structs + modules for all primitives (`Allegro.*`, default-aliased), wired to
-`openai.rs`; env-default inline config; `{:ok,_}`/`{:error,_}` + bang variants;
-pipe composition; tool loop; memory; graph routing; delegation; fan_out.
-Plus `raise`/`rescue` (error channel) and `Supervisor` (OTP-lite, §4.4) for
-self-healing agents.
-*Verify:* rebuilt examples run against OpenAI; a flaky supervised child is
-restarted and recovers.
+**Phase 4 — AI primitives, supervision & orchestration.**
+Key approach: an **embedded stdlib prelude** (presto `.pr` compiled into the
+binary via `include_str!`, registered before user code). Most OTP/graph/agent
+patterns are ordinary presto modules over structs/results/recursion — only what
+touches the network or mutable state needs Rust. Self-healing runs on
+`{:ok,_}`/`{:error,_}` **data** matched with `case`, not exceptions.
+
+- **4a (no network):** prelude mechanism; `Supervisor` (strategies
+  `one_for_one`/`one_for_all`/`rest_for_one`, `max_restarts`); `Retry`
+  (exponential backoff + jitter); `Orchestrator` (sequential/parallel/
+  conditional composition of children). All presto stdlib; verified with mock
+  `{:ok}`/`{:error}` children. Native `Process.sleep/1` for backoff.
+- **4b (network):** `Allegro.Agent`/`Tool`/`Model`/`Memory` on `openai.rs`
+  (native), env-default config, `{:ok,_}`/`{:error,_}` + bang, tool loop,
+  `fan_out`, `alias`/`import`. Plus a high-level **`Harness`** type (struct +
+  module, overridable like Agent/Tool) that composes agents/tools/orchestration
+  into one runnable unit — the tagline's centerpiece; mostly definitions + a
+  single invoke line. *Verify against OpenAI.*
+- **4c:** `StateGraph` (shared state + per-key reducers) + checkpointing;
+  `GenServer`-lite (`handle(state,msg)->{reply,state}`); `Registry`/`Store`
+  (native mutable cell value for cross-call state).
+- **4d:** `Planner` (agent writes+executes a `Plan`); optional `raise`/`rescue`.
+*Verify:* a flaky supervised child recovers; a StateGraph accumulates state; an
+agent pipeline runs against OpenAI.
 
 **Phase 5 — Ergonomics, docs & tutorial.**
 `for` comprehensions, sigils (optional), `README.md`, and **a 25-file tutorial**

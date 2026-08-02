@@ -26,6 +26,18 @@ impl Interp {
     }
 
     pub fn run(&mut self, program: &[TopItem]) -> Result<(), String> {
+        self.load_prelude()?;
+        self.register_modules(program);
+        for item in program {
+            if let TopItem::Expr(e) = item {
+                let env = self.global.clone();
+                self.eval(e, &env)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn register_modules(&mut self, program: &[TopItem]) {
         for item in program {
             if let TopItem::Module {
                 name,
@@ -36,12 +48,15 @@ impl Interp {
                 self.register(name, defs, struct_fields);
             }
         }
-        for item in program {
-            if let TopItem::Expr(e) = item {
-                let env = self.global.clone();
-                self.eval(e, &env)?;
-            }
-        }
+    }
+
+    // The presto-written standard library, compiled into the binary and
+    // registered before user code so its modules are always available.
+    fn load_prelude(&mut self) -> Result<(), String> {
+        const PRELUDE: &str = include_str!("../std/prelude.pr");
+        let toks = crate::lexer::lex(PRELUDE)?;
+        let program = crate::parser::parse(toks)?;
+        self.register_modules(&program);
         Ok(())
     }
 
@@ -97,6 +112,7 @@ impl Interp {
             Expr::Fn(clauses) => Ok(Value::Fun(Rc::new(Fun {
                 clauses: clauses.clone(),
                 closure: env.clone(),
+                module: self.current.last().cloned(),
             }))),
             Expr::AnonCall(f, args) => self.eval_anon_call(f, args, env),
             Expr::CaptureSlot(n) => env
@@ -149,10 +165,29 @@ impl Interp {
                 continue;
             }
             if self.guard_ok(&clause.guard, &call_env)? {
-                return self.eval_block(&clause.body, &call_env);
+                return self.eval_in_module(&fun.module, &clause.body, &call_env);
             }
         }
         Err("no function clause matching the given arguments".into())
+    }
+
+    // Evaluate a body with the given module pushed as the current one, so
+    // unqualified calls resolve lexically.
+    fn eval_in_module(
+        &mut self,
+        module: &Option<String>,
+        body: &[Expr],
+        env: &Env,
+    ) -> Result<Value, String> {
+        match module {
+            Some(m) => {
+                self.current.push(m.clone());
+                let result = self.eval_block(body, env);
+                self.current.pop();
+                result
+            }
+            None => self.eval_block(body, env),
+        }
     }
 
     fn eval_case(
@@ -375,6 +410,7 @@ impl Interp {
             "Map" => map_call(fun, args),
             "List" => list_call(fun, args),
             "Integer" => integer_call(fun, args),
+            "Process" => process_call(fun, args),
             _ if self.modules.contains_key(module) => {
                 if self.has_def(module, fun) {
                     self.call_user(module, fun, args)
@@ -831,6 +867,16 @@ fn match_scalar(pat: &Pattern, val: &Value) -> bool {
 
 fn ok_tuple(v: Value) -> Value {
     Value::tuple(vec![Value::Atom("ok".into()), v])
+}
+
+fn process_call(fun: &str, args: Vec<Value>) -> Result<Value, String> {
+    match (fun, args.as_slice()) {
+        ("sleep", [Value::Int(ms)]) => {
+            std::thread::sleep(std::time::Duration::from_millis((*ms).max(0) as u64));
+            Ok(Value::Atom("ok".into()))
+        }
+        _ => Err(format!("Process.{}/{} is undefined", fun, args.len())),
+    }
 }
 
 // Ordering for sort/sort_by: numbers numerically, else by string form.
