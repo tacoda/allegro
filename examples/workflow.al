@@ -3,16 +3,15 @@
 # keeps across turns. State lives in @ivars.
 
 # A Subagent is a named delegate (the Claude Code "agent" primitive).
-translator = Subagent {
+translator = Subagent.new(
   name: "translator",
   description: "Use to translate text into French",
-  model: "gpt-4o-mini",
   system: "Translate the input to French. Output only the translation.",
   temperature: 0.0
-}
+)
 
 # A Tool the model can call mid-run.
-directory = Tool {
+directory = Tool.new(
   name: "room_for",
   description: "Look up the room number for a department. Input is the department name.",
   run: def (dept)
@@ -25,15 +24,26 @@ directory = Tool {
       return "unknown department"
     end
   end
-}
+)
 
 # Memory the agent reads and writes across turns.
-notes = Memory { }
+notes = Memory.new
+
+# A module is a bag of methods mixed into a class with `include`. It carries no
+# state of its own but operates on the including instance's @ivars.
+module Counted
+  def bump
+    @handled = @handled + 1
+    return @handled
+  end
+end
 
 class Desk < Agent
+  include Counted             # composition: mix in the Counted behavior
+
+  # No model: here — it defaults from the MODEL env var (else gpt-4o-mini).
   def config
     return {
-      model: "gpt-4o-mini",
       system: "You are a concise front desk. Use the room_for tool for room questions. Whenever the visitor states a fact, you MUST call the remember tool to save it (do not just acknowledge). Before answering any question about the visitor, you MUST call recall first. One sentence.",
       subagents: [translator],
       tools: [directory],
@@ -46,7 +56,7 @@ class Desk < Agent
   end
 
   def handle(text)
-    @handled = @handled + 1
+    self.bump                 # mixed-in method updates @handled
     return self.invoke(text)
   end
 

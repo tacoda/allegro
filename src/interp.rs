@@ -87,7 +87,10 @@ impl Interp {
                 name,
                 base,
                 methods,
-            } => self.exec_class(name, base, methods, env),
+                includes,
+                forwards,
+            } => self.exec_class(name, base, methods, includes, forwards, env),
+            Stmt::Module { name, methods } => self.exec_module(name, methods, env),
         }
     }
 
@@ -96,6 +99,8 @@ impl Interp {
         name: &str,
         base: &str,
         methods: &[(String, Vec<String>, Vec<Stmt>)],
+        includes: &[String],
+        forwards: &[(String, String)],
         env: &Env,
     ) -> Result<Flow, String> {
         // A base of another class name means class-to-class inheritance;
@@ -104,9 +109,48 @@ impl Interp {
             Some(Value::Class(p)) => (p.base.clone(), Some(p)),
             _ => (base.to_string(), None),
         };
-        let mut method_map = HashMap::new();
+        let mut modules = Vec::new();
+        for m in includes {
+            match env.borrow().get(m) {
+                Some(Value::Module(module)) => modules.push(module),
+                _ => return Err(format!("include: '{}' is not a module", m)),
+            }
+        }
+        let class = Value::Class(Rc::new(Class {
+            name: name.to_string(),
+            base: base_kind,
+            parent,
+            methods: self.method_map(methods, env),
+            modules,
+            forwards: forwards.to_vec(),
+        }));
+        env.borrow_mut().define(name, class);
+        Ok(Flow::Normal(Value::Nil))
+    }
+
+    fn exec_module(
+        &mut self,
+        name: &str,
+        methods: &[(String, Vec<String>, Vec<Stmt>)],
+        env: &Env,
+    ) -> Result<Flow, String> {
+        let module = Value::Module(Rc::new(crate::value::Module {
+            name: name.to_string(),
+            methods: self.method_map(methods, env),
+        }));
+        env.borrow_mut().define(name, module);
+        Ok(Flow::Normal(Value::Nil))
+    }
+
+    // Compile a list of (name, params, body) into callable methods closing over `env`.
+    fn method_map(
+        &self,
+        methods: &[(String, Vec<String>, Vec<Stmt>)],
+        env: &Env,
+    ) -> HashMap<String, Rc<Func>> {
+        let mut map = HashMap::new();
         for (mname, params, body) in methods {
-            method_map.insert(
+            map.insert(
                 mname.clone(),
                 Rc::new(Func {
                     params: params.clone(),
@@ -115,14 +159,7 @@ impl Interp {
                 }),
             );
         }
-        let class = Value::Class(Rc::new(Class {
-            name: name.to_string(),
-            base: base_kind,
-            parent,
-            methods: method_map,
-        }));
-        env.borrow_mut().define(name, class);
-        Ok(Flow::Normal(Value::Nil))
+        map
     }
 
     fn exec_if(
@@ -396,6 +433,15 @@ impl Interp {
             Value::Harness(h) => self.harness_method(&h, name, argv),
             Value::Class(c) => self.class_method(&c, name, argv),
             Value::Instance(i) => self.instance_method(&i, name, argv),
+            // A capitalized constructor builtin responds to `.new(config)`,
+            // uniform with `Class.new`. `Agent.new(model: "...")` == `Agent { ... }`.
+            Value::Builtin(bname, f) if name == "new" && is_constructor(bname) => {
+                let cfg = argv
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| Value::Hash(Rc::new(RefCell::new(HashMap::new()))));
+                f(&[cfg])
+            }
             other => crate::methods::dispatch(other, name, argv),
         }
     }
@@ -802,9 +848,14 @@ impl Interp {
         name: &str,
         args: Vec<Value>,
     ) -> Result<Value, String> {
-        // A method the class defines or inherits wins over the base primitive.
+        // A method the class defines, mixes in, or inherits wins over the base.
         if let Some(f) = inst.class.find_method(name) {
             return self.call_bound(inst, &f, args);
+        }
+        // A `forward`ed method delegates to the named ivar's value.
+        if let Some(ivar) = inst.class.find_forward(name) {
+            let target = inst.ivars.borrow().get(&ivar).cloned().unwrap_or(Value::Nil);
+            return self.call_method(target, name, args);
         }
         match name {
             "base" => Ok(inst.base.clone()),
@@ -1046,6 +1097,26 @@ fn memory_tool_specs() -> Vec<serde_json::Value> {
             }
         }),
     ]
+}
+
+// The capitalized primitive constructors that respond to `.new`.
+fn is_constructor(name: &str) -> bool {
+    matches!(
+        name,
+        "Model"
+            | "Agent"
+            | "Subagent"
+            | "Tool"
+            | "Memory"
+            | "Rule"
+            | "Skill"
+            | "Hook"
+            | "Command"
+            | "Graph"
+            | "Factory"
+            | "Charter"
+            | "Harness"
+    )
 }
 
 // Enqueue a task or, if given an array, each of its items.

@@ -5,7 +5,6 @@
 class Researcher < Agent
   def config
     return {
-      model: "gpt-4o-mini",
       system: "Give one interesting fact about the topic. One sentence.",
       temperature: 0.3
     }
@@ -13,10 +12,10 @@ class Researcher < Agent
 end
 
 # A Factory queues tasks and drains them through the worker, one result each.
-runner = Factory {
+runner = Factory.new(
   agent: Researcher.new,
   tasks: ["octopuses", "the moon"]
-}
+)
 runner.push("coffee")
 
 for fact in runner.run

@@ -33,6 +33,7 @@ pub enum Value {
     // User-defined subclasses of the primitives, and their instances
     Class(Rc<Class>),
     Instance(Rc<Instance>),
+    Module(Rc<Module>),
     // Core data types produced by the primitives
     Message(Rc<Message>),
     HookResult(Rc<HookResult>),
@@ -171,19 +172,38 @@ pub struct Class {
     pub base: String,
     pub parent: Option<Rc<Class>>,
     pub methods: HashMap<String, Rc<Func>>,
+    pub modules: Vec<Rc<Module>>,        // mixins, in `include` order
+    pub forwards: Vec<(String, String)>, // (method, ivar) — delegated methods
 }
 
 impl Class {
-    // Walk the inheritance chain (most-derived first) for a method.
+    // Resolve a method: the class's own definitions win, then included modules
+    // (last `include` wins, Ruby-style), then the parent chain.
     pub fn find_method(&self, name: &str) -> Option<Rc<Func>> {
         if let Some(m) = self.methods.get(name) {
-            Some(m.clone())
-        } else if let Some(p) = &self.parent {
-            p.find_method(name)
-        } else {
-            None
+            return Some(m.clone());
         }
+        for module in self.modules.iter().rev() {
+            if let Some(m) = module.methods.get(name) {
+                return Some(m.clone());
+            }
+        }
+        self.parent.as_ref().and_then(|p| p.find_method(name))
     }
+
+    // Resolve a delegated method to the ivar it forwards to, walking parents.
+    pub fn find_forward(&self, name: &str) -> Option<String> {
+        if let Some((_, ivar)) = self.forwards.iter().find(|(m, _)| m == name) {
+            return Some(ivar.clone());
+        }
+        self.parent.as_ref().and_then(|p| p.find_forward(name))
+    }
+}
+
+// A bag of methods with no state of its own, mixed into classes via `include`.
+pub struct Module {
+    pub name: String,
+    pub methods: HashMap<String, Rc<Func>>,
 }
 
 // A live instance of a Class: the built primitive plus its class for dispatch.
@@ -235,6 +255,7 @@ impl Value {
             Value::Harness(_) => "harness",
             Value::Class(_) => "class",
             Value::Instance(_) => "instance",
+            Value::Module(_) => "module",
             Value::Message(_) => "message",
             Value::HookResult(_) => "hook_result",
             Value::Func(_) => "function",
@@ -304,6 +325,7 @@ impl fmt::Display for Value {
             Value::Harness(_) => write!(f, "#<harness>"),
             Value::Class(c) => write!(f, "#<class {} < {}>", c.name, c.base),
             Value::Instance(i) => write!(f, "#<{} instance>", i.class.name),
+            Value::Module(m) => write!(f, "#<module {}>", m.name),
             // A message renders as its content so it prints like a string.
             Value::Message(m) => write!(f, "{}", m.content),
             Value::HookResult(r) => write!(f, "{}", r.value),

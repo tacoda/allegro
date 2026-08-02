@@ -76,6 +76,19 @@ fn get_str(h: &HashMap<String, Value>, key: &str, default: &str) -> String {
     h.get(key).map(|v| v.to_string()).unwrap_or_else(|| default.to_string())
 }
 
+// The model to use when a constructor omits `model:` — pulled from the `MODEL`
+// environment variable, else a built-in default. Lets `Agent.new(system: "…")`
+// work with zero config.
+fn default_model() -> String {
+    std::env::var("MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string())
+}
+
+// The provider to use when a constructor omits `provider:` — from the
+// `PROVIDER` environment variable, else openai.
+fn default_provider() -> String {
+    std::env::var("PROVIDER").unwrap_or_else(|_| "openai".to_string())
+}
+
 fn get_pairs(h: &HashMap<String, Value>, key: &str) -> Vec<(String, Value)> {
     match h.get(key) {
         Some(Value::Hash(m)) => m.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -90,8 +103,8 @@ fn b_model(args: &[Value]) -> Result<Value, String> {
         _ => 0.7,
     };
     Ok(Value::Model(Rc::new(ModelObj {
-        provider: get_str(&h, "provider", "openai"),
-        name: get_str(&h, "name", "gpt-4o-mini"),
+        provider: get_str(&h, "provider", &default_provider()),
+        name: get_str(&h, "name", &default_model()),
         temperature,
     })))
 }
@@ -125,8 +138,8 @@ pub(crate) fn build_agent(cfg: &HashMap<String, Value>) -> Result<Value, String>
     // `model:` may be a model primitive or a bare string (openai shorthand).
     let (provider, model, model_temp) = match cfg.get("model") {
         Some(Value::Model(m)) => (m.provider.clone(), m.name.clone(), m.temperature),
-        Some(other) => ("openai".to_string(), other.to_string(), 0.7),
-        None => ("openai".to_string(), "gpt-4o-mini".to_string(), 0.7),
+        Some(other) => (default_provider(), other.to_string(), 0.7),
+        None => (default_provider(), default_model(), 0.7),
     };
     // An explicit agent temperature overrides the model's default.
     let temperature = match cfg.get("temperature") {

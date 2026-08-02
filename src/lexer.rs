@@ -149,6 +149,7 @@ fn is_ident_part(c: char) -> bool {
 fn keyword_or_ident(word: String) -> Tok {
     match word.as_str() {
         "class" => Tok::Class,
+        "module" => Tok::Module,
         "match" => Tok::Match,
         "when" => Tok::When,
         "if" => Tok::If,

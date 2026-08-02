@@ -1,9 +1,9 @@
 # Governance is a Charter; a Harness intakes it; an Agent is a harness + a
 # model. The governed agent is defined inline as a class.
 
-concise = Rule { name: "concise", text: "Answer in one short sentence." }
+concise = Rule.new(name: "concise", text: "Answer in one short sentence.")
 
-redact = Hook {
+redact = Hook.new(
   on: "before_run",
   do: def (input)
     if input.contains?("password")
@@ -11,19 +11,19 @@ redact = Hook {
     end
     return input
   end
-}
+)
 
-brief = Command {
+brief = Command.new(
   name: "brief",
   run: def (topic) return "brief on: " + topic end
-}
+)
 
-governance = Charter { rules: [concise], hooks: [redact], commands: [brief] }
-gov = Harness { charter: governance }
+governance = Charter.new(rules: [concise], hooks: [redact], commands: [brief])
+gov = Harness.new(charter: governance)
 
 class Assistant < Agent
   def config
-    return { model: "gpt-4o-mini", temperature: 0.2, harness: gov }
+    return { temperature: 0.2, harness: gov }
   end
 end
 
@@ -37,15 +37,15 @@ puts "safe:  " + bot.invoke("my password is hunter2").content
 puts "cmd:   " + gov.command("brief").run("the ocean")
 
 # A Graph is control-flow routing; a harness can carry one and run on its own.
-classify = Agent { model: "gpt-4o-mini", system: "Reply with ONE word: QUESTION or STATEMENT.", temperature: 0.0 }
+classify = Agent.new(system: "Reply with ONE word: QUESTION or STATEMENT.", temperature: 0.0)
 
-router = Harness {
-  graph: Graph {
+router = Harness.new(
+  graph: Graph.new(
     entry: "classify",
     nodes: { classify: classify },
     edges: { classify: "end" }
-  }
-}
+  )
+)
 
 match router.trigger("Is the sky blue?").content.strip.upcase
 when "QUESTION"

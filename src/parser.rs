@@ -5,7 +5,7 @@ use crate::token::Tok;
 const TYPE_NAMES: &[&str] = &[
     "Nil", "Bool", "Number", "String", "Array", "Hash", "Model", "Agent", "Subagent", "Tool",
     "Memory", "Rule", "Skill", "Hook",
-    "Command", "Graph", "Factory", "Charter", "Harness", "Class", "Instance", "Message",
+    "Command", "Graph", "Factory", "Charter", "Harness", "Class", "Instance", "Module", "Message",
     "HookResult", "Function",
 ];
 
@@ -22,6 +22,10 @@ pub fn parse(toks: Vec<Tok>) -> Result<Vec<Stmt>, String> {
 impl Parser {
     fn peek(&self) -> &Tok {
         &self.toks[self.pos]
+    }
+
+    fn peek_at(&self, k: usize) -> &Tok {
+        self.toks.get(self.pos + k).unwrap_or(&Tok::Eof)
     }
 
     fn advance(&mut self) -> Tok {
@@ -80,6 +84,7 @@ impl Parser {
             Tok::For => self.for_stmt(),
             Tok::Def => self.def_stmt(),
             Tok::Class => self.class_stmt(),
+            Tok::Module => self.module_stmt(),
             Tok::Return => self.return_stmt(),
             _ => Ok(Stmt::Expr(self.expr_statement()?)),
         }
@@ -225,6 +230,8 @@ impl Parser {
     }
 
     // class Name < base
+    //   include Mixin
+    //   forward :method, to: @ivar
     //   def method(params) ... end
     // end
     fn class_stmt(&mut self) -> Result<Stmt, String> {
@@ -233,14 +240,16 @@ impl Parser {
         self.eat(&Tok::Lt)?;
         let base = self.ident_name()?;
         let mut methods = Vec::new();
+        let mut includes = Vec::new();
+        let mut forwards = Vec::new();
         self.skip_newlines();
-        while self.check(&Tok::Def) {
-            self.advance();
-            let mname = self.ident_name()?;
-            let params = self.param_list()?;
-            let body = self.block(&[Tok::End])?;
-            self.eat(&Tok::End)?;
-            methods.push((mname, params, body));
+        loop {
+            match self.peek() {
+                Tok::Def => methods.push(self.method_def()?),
+                Tok::Ident(s) if s == "include" => includes.extend(self.include_directive()?),
+                Tok::Ident(s) if s == "forward" => forwards.extend(self.forward_directive()?),
+                _ => break,
+            }
             self.skip_newlines();
         }
         self.eat(&Tok::End)?;
@@ -248,7 +257,76 @@ impl Parser {
             name,
             base,
             methods,
+            includes,
+            forwards,
         })
+    }
+
+    // module Name
+    //   def method(params) ... end
+    // end
+    fn module_stmt(&mut self) -> Result<Stmt, String> {
+        self.eat(&Tok::Module)?;
+        let name = self.ident_name()?;
+        let mut methods = Vec::new();
+        self.skip_newlines();
+        while self.check(&Tok::Def) {
+            methods.push(self.method_def()?);
+            self.skip_newlines();
+        }
+        self.eat(&Tok::End)?;
+        Ok(Stmt::Module { name, methods })
+    }
+
+    // `def name(params) ... end` inside a class or module body.
+    fn method_def(&mut self) -> Result<(String, Vec<String>, Vec<Stmt>), String> {
+        self.eat(&Tok::Def)?;
+        let mname = self.ident_name()?;
+        let params = self.param_list()?;
+        let body = self.block(&[Tok::End])?;
+        self.eat(&Tok::End)?;
+        Ok((mname, params, body))
+    }
+
+    // `include A` or `include A, B` — module names to mix in.
+    fn include_directive(&mut self) -> Result<Vec<String>, String> {
+        self.advance(); // `include`
+        let mut names = vec![self.ident_name()?];
+        while self.check(&Tok::Comma) {
+            self.advance();
+            names.push(self.ident_name()?);
+        }
+        Ok(names)
+    }
+
+    // `forward :a, :b, to: @ivar` — delegate methods a and b to @ivar.
+    // Leading `:` on method names is optional sugar; `to:` names the target ivar.
+    fn forward_directive(&mut self) -> Result<Vec<(String, String)>, String> {
+        self.advance(); // `forward`
+        let mut methods = Vec::new();
+        loop {
+            if matches!(self.peek(), Tok::Ident(s) if s == "to") && self.peek_at(1) == &Tok::Colon {
+                break;
+            }
+            if self.check(&Tok::Colon) {
+                self.advance();
+            }
+            methods.push(self.ident_name()?);
+            if self.check(&Tok::Comma) {
+                self.advance();
+                self.skip_newlines();
+            } else {
+                break;
+            }
+        }
+        self.ident_name()?; // the `to` keyword
+        self.eat(&Tok::Colon)?;
+        let target = match self.advance() {
+            Tok::IVar(n) => n,
+            Tok::Ident(n) => n,
+            other => return Err(format!("forward target must be an ivar, found {:?}", other)),
+        };
+        Ok(methods.into_iter().map(|m| (m, target.clone())).collect())
     }
 
     // Anonymous function used as a value: def (params) ... end
@@ -292,6 +370,32 @@ impl Parser {
             Tok::Ident(s) => Ok(s),
             other => Err(format!("expected identifier, found {:?}", other)),
         }
+    }
+
+    // A method name after `.` — an identifier or a keyword used as a method,
+    // so Ruby-isms like `x.class` parse.
+    fn member_name(&mut self) -> Result<String, String> {
+        let word = match self.peek() {
+            Tok::Class => "class",
+            Tok::Module => "module",
+            Tok::Match => "match",
+            Tok::When => "when",
+            Tok::If => "if",
+            Tok::Elsif => "elsif",
+            Tok::Else => "else",
+            Tok::End => "end",
+            Tok::While => "while",
+            Tok::For => "for",
+            Tok::In => "in",
+            Tok::Def => "def",
+            Tok::Return => "return",
+            Tok::And => "and",
+            Tok::Or => "or",
+            Tok::Not => "not",
+            _ => return self.ident_name(),
+        };
+        self.advance();
+        Ok(word.to_string())
     }
 
     // ---- expressions ----
@@ -419,7 +523,7 @@ impl Parser {
             match self.peek() {
                 Tok::Dot => {
                     self.advance();
-                    let name = self.ident_name()?;
+                    let name = self.member_name()?;
                     let args = if self.check(&Tok::LParen) {
                         self.arg_list()?
                     } else {
@@ -431,7 +535,7 @@ impl Parser {
                     let args = self.arg_list()?;
                     e = Expr::Call(Box::new(e), args);
                 }
-                // `name { ... }` is a call with a single config hash, so
+                // `name { ... }` is a call with a single config hash, so legacy
                 // constructors read naturally: rule { name: "x", text: "y" }.
                 Tok::LBrace => {
                     let hash = self.hash_literal()?;
@@ -451,12 +555,23 @@ impl Parser {
         Ok(e)
     }
 
+    // Positional args, with Ruby-style trailing keyword args folded into one
+    // hash: `f(a, k: v, j: w)` -> `f(a, { k: v, j: w })`. Lets constructors
+    // read `Agent.new(model: "...", system: "...")`.
     fn arg_list(&mut self) -> Result<Vec<Expr>, String> {
         self.eat(&Tok::LParen)?;
         self.skip_newlines();
         let mut args = Vec::new();
+        let mut pairs = Vec::new();
         while !self.check(&Tok::RParen) {
-            args.push(self.expr()?);
+            if self.starts_keyword_arg() {
+                let key = self.hash_key()?;
+                self.eat(&Tok::Colon)?;
+                self.skip_newlines();
+                pairs.push((key, self.expr()?));
+            } else {
+                args.push(self.expr()?);
+            }
             self.skip_newlines();
             if self.check(&Tok::Comma) {
                 self.advance();
@@ -464,7 +579,15 @@ impl Parser {
             }
         }
         self.eat(&Tok::RParen)?;
+        if !pairs.is_empty() {
+            args.push(Expr::Hash(pairs));
+        }
         Ok(args)
+    }
+
+    // A `key:` at the start of an argument marks a keyword argument.
+    fn starts_keyword_arg(&self) -> bool {
+        matches!(self.peek(), Tok::Ident(_) | Tok::Str(_)) && self.peek_at(1) == &Tok::Colon
     }
 
     fn primary(&mut self) -> Result<Expr, String> {

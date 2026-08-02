@@ -74,6 +74,13 @@ pub enum Stmt {
         name: String,
         base: String,
         methods: Vec<(String, Vec<String>, Vec<Stmt>)>,
+        includes: Vec<String>,          // `include M` — mixin module names
+        forwards: Vec<(String, String)>, // `forward :m, to: @ivar` — (method, ivar)
+    },
+    // module Name ... end  — a bag of methods mixed into classes via `include`
+    Module {
+        name: String,
+        methods: Vec<(String, Vec<String>, Vec<Stmt>)>,
     },
     Return(Option<Expr>),
 }

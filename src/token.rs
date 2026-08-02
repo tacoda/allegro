@@ -7,6 +7,7 @@ pub enum Tok {
     IVar(String), // @field — instance variable
     // keywords
     Class,
+    Module,
     Match,
     When,
     If,
