@@ -4,6 +4,7 @@ pub enum Tok {
     Int(i64),
     Float(f64),
     Str(String),     // raw content, may contain `#{...}` interpolation
+    Sigil(char, String, String), // ~x<content>mods — e.g. ~w(a b c)a
     Atom(String),    // :ok, :"quoted"
     Ident(String),   // lowercase / _leading — variables and function names
     Alias(String),   // Capitalized — module names

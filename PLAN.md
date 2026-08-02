@@ -434,7 +434,10 @@ basics → 25 full multi-agent composition).
   OTP composition, centered on a runnable full-scale example
   (`examples/support_system.al`: agents as Orchestrator stages, wrapped in a
   Harness, made resilient with Retry, metered with a Store, driven by `for`).
-- Remaining: sigils (optional), and the rest of the tutorial set.
+- ✅ sigils: `~s`/`~S` (strings, any delimiter, `~s` interpolates) and
+  `~w`/`~W` (word lists; `a` modifier → atoms). Regex `~r` deferred (no regex
+  engine). Lexer emits a `Sigil` token; the parser expands it.
+- Remaining: the rest of the tutorial set.
 
 **Deferred (undecided):** static types (D6). Decoration (D8) cancelled.
 

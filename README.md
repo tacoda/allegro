@@ -63,7 +63,9 @@ Values: integers/floats, atoms (`:ok`, and `true`/`false`/`nil`), strings with
 `"#{interpolation}"`, lists `[h | t]`, tuples `{:ok, v}`, maps `%{a: 1}`
 (accessed `m.a` or `m[:a]`, updated `%{m | a: 2}`), structs `%Point{x: 1}`
 (`defstruct [:x, :y]`, updated `%Point{p | x: 2}`), and functions `fn x -> x
-end` (called `f.(x)`, captured `&Mod.fun/2`, shorthand `&(&1 + 1)`).
+end` (called `f.(x)`, captured `&Mod.fun/2`, shorthand `&(&1 + 1)`). Sigils:
+`~s(a string #{with interp})` (any delimiter, `~S` for raw) and `~w(a b c)`
+word lists (`~w(a b c)a` yields atoms).
 
 Standard library — data-first so everything pipes: `Enum` (map, filter, reject,
 reduce, find, count, any?, all?, sum, join, sort, sort_by, member?), `String`,
@@ -72,7 +74,7 @@ guards, …), `IO` (puts, inspect).
 
 **Extensions beyond Elixir-lite:** a trailing `*rest` variadic parameter
 (`def log(level, *rest)`), and the process model below. Not (yet) present:
-sigils, `alias`/`import`.
+`alias`/`import`, regex sigils (`~r`).
 
 ---
 
@@ -247,4 +249,4 @@ OTP-lite (`Supervisor`/`Orchestrator`/`Factory`/`Retry`/`Loop`), `StateGraph`
 with checkpointing, and the OpenAI-backed AI primitives.
 
 See `PLAN.md` for the full design, locked decisions, and roadmap. Deferred:
-sigils, `alias`/`import`, `Memory`, `for` `into:`/`uniq:`/`reduce:`.
+`alias`/`import`, regex sigils, `Memory`, `for` `into:`/`uniq:`/`reduce:`.

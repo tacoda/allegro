@@ -24,6 +24,11 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 out.push(Tok::Atom(a));
                 i = ni;
             }
+            '~' if peek(&c, i + 1).map_or(false, |n| n.is_ascii_alphabetic()) => {
+                let (t, ni) = crate::sigils::lex(&c, i)?;
+                out.push(t);
+                i = ni;
+            }
             _ if ch.is_ascii_digit() => {
                 let (t, ni) = lex_number(&c, i);
                 out.push(t);
@@ -65,6 +70,7 @@ fn skip_comment(c: &[char], i: &mut usize) {
         *i += 1;
     }
 }
+
 
 fn peek(c: &[char], i: usize) -> Option<char> {
     c.get(i).copied()

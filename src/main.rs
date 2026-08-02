@@ -10,6 +10,7 @@ mod parser;
 mod patterns;
 mod prims;
 mod scheduler;
+mod sigils;
 mod token;
 mod value;
 

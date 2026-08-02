@@ -372,34 +372,17 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
+        if let Some(lit) = self.scalar_literal() {
+            return Ok(lit);
+        }
         match self.peek().clone() {
-            Tok::Int(n) => {
-                self.advance();
-                Ok(Expr::Int(n))
-            }
-            Tok::Float(f) => {
-                self.advance();
-                Ok(Expr::Float(f))
-            }
-            Tok::Atom(a) => {
-                self.advance();
-                Ok(Expr::Atom(a))
-            }
-            Tok::True => {
-                self.advance();
-                Ok(Expr::Bool(true))
-            }
-            Tok::False => {
-                self.advance();
-                Ok(Expr::Bool(false))
-            }
-            Tok::Nil => {
-                self.advance();
-                Ok(Expr::Nil)
-            }
             Tok::Str(raw) => {
                 self.advance();
                 Ok(Expr::Str(parse_interpolation(&raw)?))
+            }
+            Tok::Sigil(letter, content, mods) => {
+                self.advance();
+                crate::sigils::expand(letter, &content, &mods)
             }
             Tok::Ident(name) => {
                 self.advance();
@@ -438,6 +421,22 @@ impl Parser {
             }
             other => Err(format!("unexpected token {:?}", other)),
         }
+    }
+
+    // The atomic literal tokens (numbers, atoms, booleans, nil), consumed in
+    // one place so `primary` stays small.
+    fn scalar_literal(&mut self) -> Option<Expr> {
+        let lit = match self.peek() {
+            Tok::Int(n) => Expr::Int(*n),
+            Tok::Float(f) => Expr::Float(*f),
+            Tok::Atom(a) => Expr::Atom(a.clone()),
+            Tok::True => Expr::Bool(true),
+            Tok::False => Expr::Bool(false),
+            Tok::Nil => Expr::Nil,
+            _ => return None,
+        };
+        self.advance();
+        Some(lit)
     }
 
     // A capitalized alias: a module path, then optionally `.fun(args)`.
@@ -1046,7 +1045,7 @@ fn max_slot(e: &Expr) -> usize {
 
 // Convert an expression used in pattern position into a Pattern.
 // Split a raw string into literal chunks and `#{ expr }` interpolations.
-fn parse_interpolation(raw: &str) -> Result<Vec<StrPart>, String> {
+pub(crate) fn parse_interpolation(raw: &str) -> Result<Vec<StrPart>, String> {
     let chars: Vec<char> = raw.chars().collect();
     let mut parts = Vec::new();
     let mut lit = String::new();
