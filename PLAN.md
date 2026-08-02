@@ -237,9 +237,21 @@ agent =
 IO.puts(msg.content)
 ```
 
-Modules (each with `new/1` + operations): `Model`, `Agent`, `Subagent`, `Tool`,
-`Memory`, `Rule`, `Skill`, `Hook`, `Command`, `Charter`, `Harness`, `Graph`,
-`Factory`. `Agent.new/1` reuses today's `build_agent` assembly logic.
+Two tiers — high-level concepts take customizations; low-level pieces are the
+building blocks they compose from. Both are structs + modules (`new/1` +
+operations), so either tier can be defined or overridden by the user.
+
+- **Low-level (building blocks):** `Model`, `Tool`, `Context` (assembled model
+  input: system + history + memory + retrieved docs + tools), `Memory`, `Rule`,
+  `Skill`, `Hook`, `Command`, `Message`.
+- **High-level (take config/customization):** `Agent`, `Charter` (governance
+  bundle), `Harness` (composes into one runnable unit), `Graph` (routing),
+  `Factory` (worker queue), `Loop` (run-until-done / agentic loop),
+  `Orchestrator`, `Supervisor`, `Subagent`.
+
+`Agent.new/1` reuses the old `build_agent` assembly logic. High-level concepts
+are mostly written in presto over the low-level pieces + prelude; only `Model`/
+`Agent.run`/`Tool` execution and mutable stores need Rust.
 
 ### 4.4 Supervision (OTP-lite, no processes)
 
