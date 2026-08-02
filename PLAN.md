@@ -406,12 +406,14 @@ touches the network or mutable state needs Rust. Self-healing runs on
   module, overridable like Agent/Tool) that composes agents/tools/orchestration
   into one runnable unit — the tagline's centerpiece; mostly definitions + a
   single invoke line. *Verify against OpenAI.*
-- **4c:** ✅ `Store` (native mutable cell `Value::Ref` for cross-call state) and
-  `Registry` (`Process.register/2`, `Process.whereis/1`, `send` by name) done —
-  see `examples/state.al`, `examples/self_healing.al` (Store persists across
-  supervisor restarts, so a flaky child recovers). `GenServer`-lite is already
-  covered by actors (`handle/2` + state). Remaining: `StateGraph` (shared state
-  + per-key reducers) + checkpointing.
+- **4c:** ✅ done. `Store` (native mutable cell `Value::Ref` for cross-call
+  state) and `Registry` (`Process.register/2`, `Process.whereis/1`, `send` by
+  name) — see `examples/state.al`, `examples/self_healing.al` (Store persists
+  across supervisor restarts, so a flaky child recovers). `GenServer`-lite is
+  already covered by actors (`handle/2` + state). `StateGraph` (nodes over a
+  shared state map, per-key reducers, conditional routing) + checkpointing +
+  `resume` from any checkpoint — allegro stdlib over `Store`/`Map`; see
+  `examples/state_graph.al`.
 - **4d:** `Planner` (agent writes+executes a `Plan`); optional `raise`/`rescue`.
 *Verify:* a flaky supervised child recovers; a StateGraph accumulates state; an
 agent pipeline runs against OpenAI.

@@ -222,3 +222,78 @@ defmodule Loop do
     end
   end
 end
+
+# ---------------------------------------------------------------------------
+# StateGraph — a graph of nodes over a shared state map (LangGraph-flavored).
+#
+# * state    — a map; nodes read it and return a partial-update map.
+# * nodes    — %{name => fn(state) -> update_map}.
+# * edges    — %{name => next}, where `next` is a node name or a
+#              fn(state) -> node name (conditional routing). `:end` stops.
+# * reducers — %{key => fn(current, update) -> merged}; keys without a reducer
+#              are overwritten. (e.g. an append reducer accumulates history.)
+#
+# Every node transition is checkpointed as %{node: name, state: state}; `run`
+# returns {:ok, final_state, checkpoints}. `resume` restarts from any saved
+# checkpoint, so a run can be inspected, replayed, or continued.
+# ---------------------------------------------------------------------------
+defmodule StateGraph do
+  defstruct [:entry, :nodes, :edges, :reducers]
+
+  def new(spec) do
+    %StateGraph{
+      entry: Map.get(spec, :entry),
+      nodes: Map.get(spec, :nodes, %{}),
+      edges: Map.get(spec, :edges, %{}),
+      reducers: Map.get(spec, :reducers, %{})
+    }
+  end
+
+  def run(graph, initial), do: run(graph, initial, 50)
+
+  def run(%StateGraph{entry: entry} = graph, initial, max) do
+    drive(graph, initial, entry, max, Store.new([]))
+  end
+
+  # Continue from a saved checkpoint: pick up at the edge out of its node.
+  def resume(graph, checkpoint), do: resume(graph, checkpoint, 50)
+
+  def resume(%StateGraph{} = graph, %{node: node, state: state}, max) do
+    next = resolve_edge(Map.get(graph.edges, node), state)
+    drive(graph, state, next, max, Store.new([]))
+  end
+
+  defp drive(_graph, state, :end, _fuel, checkpoints) do
+    {:ok, state, Enum.reverse(Store.get(checkpoints))}
+  end
+
+  defp drive(_graph, state, _node, 0, checkpoints) do
+    {:error, {:max_steps, state}, Enum.reverse(Store.get(checkpoints))}
+  end
+
+  defp drive(graph, state, node, fuel, checkpoints) do
+    node_fn = Map.get(graph.nodes, node)
+    state = merge(state, node_fn.(state), graph.reducers)
+    Store.update(checkpoints, fn log -> [%{node: node, state: state} | log] end)
+    next = resolve_edge(Map.get(graph.edges, node), state)
+    drive(graph, state, next, fuel - 1, checkpoints)
+  end
+
+  # Merge a node's partial update into the state, per-key reducer or overwrite.
+  defp merge(state, update, reducers) do
+    Enum.reduce(Map.keys(update), state, fn acc, key ->
+      merged = reduce_key(reducers, key, Map.get(acc, key), Map.get(update, key))
+      Map.put(acc, key, merged)
+    end)
+  end
+
+  defp reduce_key(reducers, key, current, update) do
+    case Map.fetch(reducers, key) do
+      {:ok, reducer} -> reducer.(current, update)
+      :error -> update
+    end
+  end
+
+  defp resolve_edge(edge, state) when is_function(edge), do: edge.(state)
+  defp resolve_edge(edge, _state), do: edge
+end
