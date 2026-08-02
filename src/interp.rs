@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use crate::ast::{BinOp, CaseClause, Def, Expr, Pattern, StrPart, StructFields, TopItem, UnOp};
 use crate::parser::expr_to_pattern;
+use crate::scheduler::{Handler, HandlerRef, Scheduler};
 use crate::value::{new_env, values_equal, Env, Fun, Value};
 
 pub struct Interp {
@@ -13,6 +14,8 @@ pub struct Interp {
     global: Env,
     // stack of the module whose body is executing, for local-call resolution
     current: Vec<String>,
+    // the actor scheduler (spawn/send/receive)
+    sched: Scheduler,
 }
 
 impl Interp {
@@ -22,6 +25,7 @@ impl Interp {
             structs: HashMap::new(),
             global: new_env(None),
             current: Vec::new(),
+            sched: Scheduler::new(),
         }
     }
 
@@ -34,6 +38,8 @@ impl Interp {
                 self.eval(e, &env)?;
             }
         }
+        // Drain any spawned processes that still have mail to handle.
+        self.drain()?;
         Ok(())
     }
 
@@ -50,10 +56,10 @@ impl Interp {
         }
     }
 
-    // The presto-written standard library, compiled into the binary and
+    // The allegro-written standard library, compiled into the binary and
     // registered before user code so its modules are always available.
     fn load_prelude(&mut self) -> Result<(), String> {
-        const PRELUDE: &str = include_str!("../std/prelude.pr");
+        const PRELUDE: &str = include_str!("../std/prelude.al");
         let toks = crate::lexer::lex(PRELUDE)?;
         let program = crate::parser::parse(toks)?;
         self.register_modules(&program);
@@ -108,7 +114,9 @@ impl Interp {
                 self.remote_call(m, f, argv)
             }
             Expr::Field(base, field) => self.eval_field(base, field, env),
-            Expr::ModuleRef(m) => Err(format!("module {} is not a value", m)),
+            // A module is a value — its name as an atom (Elixir semantics); this
+            // is what lets `spawn(Counter, ...)` name a handler module.
+            Expr::ModuleRef(m) => Ok(Value::Atom(m.clone())),
             Expr::Fn(clauses) => Ok(Value::Fun(Rc::new(Fun {
                 clauses: clauses.clone(),
                 closure: env.clone(),
@@ -134,6 +142,7 @@ impl Interp {
             }
             Expr::Cond(clauses) => self.eval_cond(clauses, env),
             Expr::With(clauses, body, els) => self.eval_with(clauses, body, els, env),
+            Expr::Receive(clauses, after) => self.eval_receive(clauses, after, env),
             Expr::Pin(_) => Err("^pin is only valid inside a pattern".into()),
         }
     }
@@ -155,7 +164,7 @@ impl Interp {
         }
     }
 
-    fn call_fun(&mut self, fun: &Rc<Fun>, args: Vec<Value>) -> Result<Value, String> {
+    pub(crate) fn call_fun(&mut self, fun: &Rc<Fun>, args: Vec<Value>) -> Result<Value, String> {
         for clause in &fun.clauses {
             if clause.params.len() != args.len() {
                 continue;
@@ -244,6 +253,141 @@ impl Interp {
             last = self.eval(s, env)?;
         }
         Ok(last)
+    }
+
+    // ---- processes (actor scheduler) ----
+
+    // `spawn(Module, init)` (dispatches `Module.handle/2`) or
+    // `spawn(fn state, msg -> ... end, init)`. A module is passed as its atom.
+    fn spawn_proc(&mut self, handler: &Value, state: Value) -> Result<Value, String> {
+        let h = match handler {
+            Value::Fun(f) => Handler::Fun(f.clone()),
+            Value::Atom(name) if self.modules.contains_key(name) => Handler::Module(name.clone()),
+            other => {
+                return Err(format!(
+                    "spawn expects a module or fn handler, got a {}",
+                    other.type_name()
+                ))
+            }
+        };
+        Ok(Value::Pid(self.sched.spawn(h, state)))
+    }
+
+    // `receive` matches the current process's mailbox against the clauses. On a
+    // miss it steps other ready actors and retries; when the scheduler is idle
+    // (no message can ever arrive) it runs the `after` body, or deadlocks.
+    fn eval_receive(
+        &mut self,
+        clauses: &[CaseClause],
+        after: &Option<Vec<Expr>>,
+        env: &Env,
+    ) -> Result<Value, String> {
+        let me = self.sched.current;
+        loop {
+            if let Some(value) = self.match_mailbox(clauses, me, env)? {
+                return Ok(value);
+            }
+            match self.sched.next_ready() {
+                Some((pid, m)) => self.step(pid, m)?,
+                None => return self.receive_timeout(after, env),
+            }
+        }
+    }
+
+    // Scan the process's mailbox for the first message matching a clause; on a
+    // hit, remove it and evaluate the clause body.
+    fn match_mailbox(
+        &mut self,
+        clauses: &[CaseClause],
+        me: u64,
+        env: &Env,
+    ) -> Result<Option<Value>, String> {
+        for (idx, msg) in self.sched.mailbox_snapshot(me).into_iter().enumerate() {
+            for clause in clauses {
+                let arm_env = new_env(Some(env.clone()));
+                if self.match_pattern(&clause.pat, &msg, &arm_env)?
+                    && self.guard_ok(&clause.guard, &arm_env)?
+                {
+                    self.sched.take_message(me, idx);
+                    return Ok(Some(self.eval_block(&clause.body, &arm_env)?));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn receive_timeout(&mut self, after: &Option<Vec<Expr>>, env: &Env) -> Result<Value, String> {
+        match after {
+            Some(body) => self.eval_block(body, env),
+            None => {
+                Err("deadlock: receive with an empty mailbox and no runnable processes".into())
+            }
+        }
+    }
+
+    // Run all ready actors until the scheduler is idle.
+    fn drain(&mut self) -> Result<(), String> {
+        while let Some((pid, msg)) = self.sched.next_ready() {
+            self.step(pid, msg)?;
+        }
+        Ok(())
+    }
+
+    // Deliver one message to a process: run its handler with the process's
+    // current state. A handler that raises (returns Err) crashes the process
+    // rather than aborting the whole program.
+    fn step(&mut self, pid: u64, msg: Value) -> Result<(), String> {
+        let handler = match self.sched.handler_of(pid) {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+        let state = self.sched.state_of(pid);
+        let prev = self.sched.current;
+        self.sched.current = pid;
+        let result = match handler {
+            HandlerRef::Root => Ok(Value::Nil),
+            HandlerRef::Module(m) => self.remote_call(&m, "handle", vec![state, msg]),
+            HandlerRef::Fun(f) => self.call_fun(&f, vec![state, msg]),
+        };
+        self.sched.current = prev;
+        match result {
+            Ok(ret) => self.apply_return(pid, ret),
+            Err(reason) => self.terminate(pid, Value::Str(reason)),
+        }
+        Ok(())
+    }
+
+    // Interpret a handler's return: `{:noreply, s}` updates state,
+    // `{:stop, reason[, s]}` terminates, anything else becomes the new state.
+    fn apply_return(&mut self, pid: u64, ret: Value) {
+        if let Value::Tuple(t) = &ret {
+            match t.as_slice() {
+                [Value::Atom(a), s] if a == "noreply" => {
+                    return self.sched.set_state(pid, s.clone());
+                }
+                [Value::Atom(a), reason, s] if a == "stop" => {
+                    self.sched.set_state(pid, s.clone());
+                    return self.terminate(pid, reason.clone());
+                }
+                [Value::Atom(a), reason] if a == "stop" => {
+                    return self.terminate(pid, reason.clone());
+                }
+                _ => {}
+            }
+        }
+        self.sched.set_state(pid, ret);
+    }
+
+    // Kill a process and notify its monitors with `{:DOWN, pid, reason}`.
+    fn terminate(&mut self, pid: u64, reason: Value) {
+        for watcher in self.sched.kill(pid) {
+            let down = Value::tuple(vec![
+                Value::Atom("DOWN".into()),
+                Value::Pid(pid),
+                reason.clone(),
+            ]);
+            self.sched.deliver(watcher, down);
+        }
     }
 
     fn eval_args(&mut self, args: &[Expr], env: &Env) -> Result<Vec<Value>, String> {
@@ -395,10 +539,36 @@ impl Interp {
                 return self.call_user(&module, name, args);
             }
         }
+        if let Some(v) = self.process_builtin(name, &args)? {
+            return Ok(v);
+        }
         if is_kernel(name) {
             return kernel_call(name, args);
         }
         Err(format!("undefined function {}/{}", name, args.len()))
+    }
+
+    // Auto-imported process primitives (Elixir's `Kernel`): `spawn/1,2`,
+    // `self/0`, `send/2`, `monitor/1`.
+    fn process_builtin(&mut self, name: &str, args: &[Value]) -> Result<Option<Value>, String> {
+        match (name, args) {
+            ("spawn", [handler]) => Ok(Some(self.spawn_proc(handler, Value::Nil)?)),
+            ("spawn", [handler, state]) => Ok(Some(self.spawn_proc(handler, state.clone())?)),
+            ("self", []) => Ok(Some(Value::Pid(self.sched.current))),
+            ("send", [Value::Pid(pid), msg]) => {
+                self.sched.deliver(*pid, msg.clone());
+                Ok(Some(msg.clone()))
+            }
+            ("send", [other, _]) => {
+                Err(format!("send/2 expects a pid, got a {}", other.type_name()))
+            }
+            ("monitor", [Value::Pid(pid)]) => {
+                let me = self.sched.current;
+                self.sched.monitor(me, *pid);
+                Ok(Some(Value::Pid(*pid)))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn remote_call(&mut self, module: &str, fun: &str, args: Vec<Value>) -> Result<Value, String> {
@@ -411,14 +581,19 @@ impl Interp {
             "List" => list_call(fun, args),
             "Integer" => integer_call(fun, args),
             "Process" => process_call(fun, args),
-            _ if self.modules.contains_key(module) => {
-                if self.has_def(module, fun) {
-                    self.call_user(module, fun, args)
-                } else {
-                    Err(format!("function {}.{}/{} is undefined", module, fun, args.len()))
-                }
+            _ if crate::prims::is_ai_module(module) => {
+                crate::prims::dispatch(self, module, fun, args)
             }
+            _ if self.modules.contains_key(module) => self.call_module(module, fun, args),
             _ => Err(format!("module {} is not available", module)),
+        }
+    }
+
+    fn call_module(&mut self, module: &str, fun: &str, args: Vec<Value>) -> Result<Value, String> {
+        if self.has_def(module, fun) {
+            self.call_user(module, fun, args)
+        } else {
+            Err(format!("function {}.{}/{} is undefined", module, fun, args.len()))
         }
     }
 

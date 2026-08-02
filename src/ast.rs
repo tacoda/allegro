@@ -60,6 +60,7 @@ pub enum Expr {
     Case(Box<Expr>, Vec<CaseClause>),
     Cond(Vec<(Expr, Vec<Expr>)>),          // condition -> body
     With(Vec<(Pattern, Expr)>, Vec<Expr>, Option<Vec<CaseClause>>), // clauses, body, else
+    Receive(Vec<CaseClause>, Option<Vec<Expr>>), // receive do clauses [after _ -> body] end
     Pin(String),                           // ^var, only in pattern position
 }
 

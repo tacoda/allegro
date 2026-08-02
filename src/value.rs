@@ -17,6 +17,7 @@ pub enum Value {
     Tuple(Rc<Vec<Value>>),
     Map(Rc<Vec<(Value, Value)>>), // insertion order; keys deduped on build
     Fun(Rc<Fun>),
+    Pid(u64), // a lightweight process id in the actor scheduler
 }
 
 // An anonymous function: clauses tried in order, closing over its definition
@@ -45,6 +46,7 @@ impl Value {
             Value::Tuple(_) => "tuple",
             Value::Map(_) => "map",
             Value::Fun(_) => "function",
+            Value::Pid(_) => "pid",
         }
     }
 
@@ -95,6 +97,7 @@ impl fmt::Display for Value {
             Value::Str(s) => write!(f, "{}", s),
             Value::List(_) | Value::Tuple(_) | Value::Map(_) => write!(f, "{}", self.inspect()),
             Value::Fun(_) => write!(f, "#Function"),
+            Value::Pid(id) => write!(f, "#PID<{}>", id),
         }
     }
 }
@@ -136,6 +139,7 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Atom(x), Value::Atom(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Nil, Value::Nil) => true,
+        (Value::Pid(x), Value::Pid(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::List(x), Value::List(y)) | (Value::Tuple(x), Value::Tuple(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| values_equal(p, q))

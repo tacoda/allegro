@@ -1,13 +1,13 @@
 [package]
-name = "presto"
+name = "allegro"
 version = "0.1.0"
 edition = "2021"
-description = "Presto — a language to easily build agent harnesses"
+description = "Allegro — a language to easily build agent harnesses"
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = "1"
 
 [[bin]]
-name = "presto"
+name = "allegro"
 path = "src/main.rs"

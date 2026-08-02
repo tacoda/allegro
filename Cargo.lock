@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "allegro"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde_json",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -466,14 +474,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0103b1cef7ec0cf76490e969665504990193874ea05c85ff9bab8b911d0a0564"
 dependencies = [
  "zerovec",
-]
-
-[[package]]
-name = "presto"
-version = "0.1.0"
-dependencies = [
- "reqwest",
- "serde_json",
 ]
 
 [[package]]

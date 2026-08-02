@@ -6,6 +6,8 @@ mod interp;
 mod lexer;
 mod openai;
 mod parser;
+mod prims;
+mod scheduler;
 mod token;
 mod value;
 
@@ -21,7 +23,7 @@ fn main() {
         _ => None,
     };
     let Some(path) = path else {
-        eprintln!("usage: presto run <file.pr>");
+        eprintln!("usage: allegro run <file.al>");
         exit(2);
     };
 

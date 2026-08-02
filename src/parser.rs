@@ -418,6 +418,7 @@ impl Parser {
             Tok::Case => self.case_expr(),
             Tok::Cond => self.cond_expr(),
             Tok::With => self.with_expr(),
+            Tok::Receive => self.receive_expr(),
             Tok::Amp => self.capture_expr(),
             Tok::Caret => {
                 self.advance();
@@ -723,6 +724,34 @@ impl Parser {
             self.skip_newlines();
         }
         Ok(clauses)
+    }
+
+    // `receive do <clauses> [after <ms> -> <body>] end`. The timeout expr is
+    // parsed but ignored: the scheduler is single-threaded, so once it is idle
+    // no further message can arrive — idle *is* the timeout.
+    fn receive_expr(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::Receive)?;
+        self.eat(&Tok::Do)?;
+        let mut clauses = Vec::new();
+        self.skip_newlines();
+        while !self.check(&Tok::End) && !self.check(&Tok::After) {
+            let pat = expr_to_pattern(self.expr()?)?;
+            let guard = self.opt_guard()?;
+            self.eat(&Tok::Arrow)?;
+            let body = self.clause_body()?;
+            clauses.push(CaseClause { pat, guard, body });
+            self.skip_newlines();
+        }
+        let after = if self.check(&Tok::After) {
+            self.advance();
+            let _ms = self.expr()?; // timeout value, ignored (see above)
+            self.eat(&Tok::Arrow)?;
+            Some(self.clause_body()?)
+        } else {
+            None
+        };
+        self.eat(&Tok::End)?;
+        Ok(Expr::Receive(clauses, after))
     }
 
     fn cond_expr(&mut self) -> Result<Expr, String> {

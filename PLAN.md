@@ -1,11 +1,10 @@
-# Presto — Elixir-flavored functional language: rewrite plan
+# Allegro — Elixir-flavored functional language: rewrite plan
 
-> Project renamed **allegro → presto**; source files use the **`.pr`**
-> extension. (Repo dir/git remote updated separately.)
+> Source files use the **`.al`** extension.
 
 ## 1. Goal & non-goals
 
-**Tagline: Presto is a language to easily build agent harnesses.**
+**Tagline: Allegro is a language to easily build agent harnesses.**
 
 **File convention.** A program/example is mostly *definitions* (`defmodule`s),
 with a **single invoke line at the bottom** to run it standalone (e.g.
@@ -23,11 +22,15 @@ selected by **pattern matching**.
   interpreter**. The binary reads a `.al` file and evaluates its AST directly.
 - **No compilation yet.** Interpreted is the target for now; a compiler is a
   later, separate effort.
-- No BEAM processes/actors, no concurrency model, no distribution. (`fan_out`
-  stays a thread-pool helper as today, not a process model.)
-- **OTP-lite is in scope**: cooperative supervision + self-healing (restart
-  failed children per a strategy) built on error-catching, *not* on processes.
-  See §4.4.
+- **Process model — IN scope (D9, reverses the earlier non-goal).** An
+  **actor scheduler**: cooperative, single-threaded, run-to-completion. A
+  process is `state + a handler`; `spawn/send/self/monitor` + `receive`. No
+  BEAM/VM, still no true parallelism or multi-node distribution — the
+  *programming model* (message passing, mailboxes, queues, supervised workers)
+  is what's provided, on one OS thread. `fan_out` stays a thread-pool helper.
+- **OTP-lite is in scope**, now built on the actor scheduler: `Orchestrator`
+  fans out to worker processes, `Factory` is a worker pool draining a queue,
+  `Supervisor` monitors real processes and restarts them on crash. See §4.4.
 - No macros/metaprogramming in phase 1 (`defmacro`), no protocols/behaviours in
   phase 1.
 
@@ -250,7 +253,7 @@ operations), so either tier can be defined or overridden by the user.
   `Orchestrator`, `Supervisor`, `Subagent`.
 
 `Agent.new/1` reuses the old `build_agent` assembly logic. High-level concepts
-are mostly written in presto over the low-level pieces + prelude; only `Model`/
+are mostly written in allegro over the low-level pieces + prelude; only `Model`/
 `Agent.run`/`Tool` execution and mutable stores need Rust.
 
 ### 4.4 Supervision (OTP-lite, no processes)
@@ -386,16 +389,16 @@ trip; `*rest`. (`alias`/`import` deferred to phase 4 where `Allegro.*` aliasing
 matters.)
 
 **Phase 4 — AI primitives, supervision & orchestration.**
-Key approach: an **embedded stdlib prelude** (presto `.pr` compiled into the
+Key approach: an **embedded stdlib prelude** (allegro `.al` compiled into the
 binary via `include_str!`, registered before user code). Most OTP/graph/agent
-patterns are ordinary presto modules over structs/results/recursion — only what
+patterns are ordinary allegro modules over structs/results/recursion — only what
 touches the network or mutable state needs Rust. Self-healing runs on
 `{:ok,_}`/`{:error,_}` **data** matched with `case`, not exceptions.
 
 - **4a (no network):** prelude mechanism; `Supervisor` (strategies
   `one_for_one`/`one_for_all`/`rest_for_one`, `max_restarts`); `Retry`
   (exponential backoff + jitter); `Orchestrator` (sequential/parallel/
-  conditional composition of children). All presto stdlib; verified with mock
+  conditional composition of children). All allegro stdlib; verified with mock
   `{:ok}`/`{:error}` children. Native `Process.sleep/1` for backoff.
 - **4b (network):** `Allegro.Agent`/`Tool`/`Model`/`Memory` on `openai.rs`
   (native), env-default config, `{:ok,_}`/`{:error,_}` + bang, tool loop,
@@ -441,6 +444,16 @@ basics → 25 full multi-agent composition).
   `{:ok, t} | {:error, e}` (Rust semantics, Elixir clothing).
 - **D8 Decoration — CANCELLED.** No protocol/behaviour, no decoration feature.
   Wrapping/delegation, when needed, is just ordinary multi-clause dispatch.
+- **D9 Process model — ACTOR/STEP SCHEDULER (reverses the earlier "no
+  processes" non-goal).** Cooperative, single-threaded, run-to-completion:
+  a process is `state + handler`, driven by `spawn/2`, `send/2`, `self/0`,
+  `monitor/1`, and `receive`. Handlers never block (they return the new
+  state); only the root flow may `receive` (it sits at the base of the Rust
+  stack, so blocking there is just running the driver loop inline). Rejected:
+  stackful coroutines (new dep + `unsafe` reentrancy) and a stackless evaluator
+  rewrite — the actor model needs neither and keeps the tree-walker untouched.
+  Message isolation is free because values are immutable `Rc`. `Orchestrator`/
+  `Factory`/`Supervisor` are ordinary allegro stdlib over these primitives.
 
 ## 9. Risks
 
