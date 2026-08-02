@@ -400,12 +400,13 @@ touches the network or mutable state needs Rust. Self-healing runs on
   (exponential backoff + jitter); `Orchestrator` (sequential/parallel/
   conditional composition of children). All allegro stdlib; verified with mock
   `{:ok}`/`{:error}` children. Native `Process.sleep/1` for backoff.
-- **4b (network):** `Allegro.Agent`/`Tool`/`Model`/`Memory` on `openai.rs`
-  (native), env-default config, `{:ok,_}`/`{:error,_}` + bang, tool loop,
-  `fan_out`, `alias`/`import`. Plus a high-level **`Harness`** type (struct +
-  module, overridable like Agent/Tool) that composes agents/tools/orchestration
-  into one runnable unit — the tagline's centerpiece; mostly definitions + a
-  single invoke line. *Verify against OpenAI.*
+- **4b (network):** ✅ verified against OpenAI. `Agent`/`Tool`/`Model`/`Message`
+  on `openai.rs` (native, `src/prims.rs`), env-default config (MODEL/PROVIDER/
+  OPENAI_API_KEY), `{:ok,_}`/`{:error,_}` + `run!` bang, the tool-calling loop,
+  and `fan_out` (concurrent). The high-level **`Harness`** (struct + module,
+  overridable) composes an agent/tool pipeline into one runnable unit. See
+  `examples/agent.al` (concierge answers via a `room_for` tool call; a Harness
+  wraps the agent). Deferred: `Memory`, `alias`/`import` sugar.
 - **4c:** ✅ done. `Store` (native mutable cell `Value::Ref` for cross-call
   state) and `Registry` (`Process.register/2`, `Process.whereis/1`, `send` by
   name) — see `examples/state.al`, `examples/self_healing.al` (Store persists
