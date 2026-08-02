@@ -27,6 +27,7 @@ pub enum Tok {
     With,
     Receive,
     After,
+    For,
     And,
     Or,
     Not,

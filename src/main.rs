@@ -4,6 +4,7 @@
 mod ast;
 mod interp;
 mod lexer;
+mod natives;
 mod openai;
 mod parser;
 mod prims;

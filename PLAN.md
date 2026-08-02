@@ -425,6 +425,13 @@ in `examples/` of growing complexity — each a standalone, runnable `.al` (01
 basics → 25 full multi-agent composition).
 *Verify:* every one of the 25 examples runs.
 
+- ✅ `for` comprehensions: generators (`pat <- enum`), filters, multiple
+  (cartesian) generators, map iteration (`{k, v} <-`), pattern-filtering
+  (non-matching generator element is dropped), `do:`/`do…end`; yields a list,
+  bindings scoped to the comprehension. See `examples/comprehensions.al`.
+  Deferred: `into:`, `uniq:`, `reduce:`.
+- Remaining: sigils (optional), README, and the rest of the tutorial set.
+
 **Deferred (undecided):** static types (D6). Decoration (D8) cancelled.
 
 ## 8. Decisions (LOCKED)

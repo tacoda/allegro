@@ -297,6 +297,7 @@ fn classify(word: String) -> Tok {
         "with" => Tok::With,
         "receive" => Tok::Receive,
         "after" => Tok::After,
+        "for" => Tok::For,
         "and" => Tok::And,
         "or" => Tok::Or,
         "not" => Tok::Not,

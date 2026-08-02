@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, CaseClause, Def, Expr, FnClause, Pattern, StrPart, TopItem, UnOp};
+use crate::ast::{BinOp, CaseClause, Def, Expr, FnClause, ForClause, Pattern, StrPart, TopItem, UnOp};
 use crate::token::Tok;
 
 pub fn parse(toks: Vec<Tok>) -> Result<Vec<TopItem>, String> {
@@ -419,6 +419,7 @@ impl Parser {
             Tok::Cond => self.cond_expr(),
             Tok::With => self.with_expr(),
             Tok::Receive => self.receive_expr(),
+            Tok::For => self.for_expr(),
             Tok::Amp => self.capture_expr(),
             Tok::Caret => {
                 self.advance();
@@ -752,6 +753,41 @@ impl Parser {
         };
         self.eat(&Tok::End)?;
         Ok(Expr::Receive(clauses, after))
+    }
+
+    // `for <clause>, <clause>, ... do body end` or `for <clause>, do: expr`.
+    // A clause is a generator `pat <- enumerable` or a boolean filter.
+    fn for_expr(&mut self) -> Result<Expr, String> {
+        self.eat(&Tok::For)?;
+        let mut clauses = vec![self.for_clause()?];
+        while self.check(&Tok::Comma) {
+            self.advance();
+            if matches!(self.peek(), Tok::KwKey(k) if k == "do") {
+                break; // the trailing `, do:` keyword body
+            }
+            clauses.push(self.for_clause()?);
+        }
+        let body = if matches!(self.peek(), Tok::KwKey(k) if k == "do") {
+            self.expect_kwkey("do")?;
+            vec![self.expr()?]
+        } else {
+            self.eat(&Tok::Do)?;
+            let b = self.block(&[Tok::End])?;
+            self.eat(&Tok::End)?;
+            b
+        };
+        Ok(Expr::For(clauses, body))
+    }
+
+    fn for_clause(&mut self) -> Result<ForClause, String> {
+        let lhs = self.expr()?;
+        if self.check(&Tok::LArrow) {
+            self.advance();
+            let src = self.expr()?;
+            Ok(ForClause::Gen(expr_to_pattern(lhs)?, src))
+        } else {
+            Ok(ForClause::Filter(lhs))
+        }
     }
 
     fn cond_expr(&mut self) -> Result<Expr, String> {

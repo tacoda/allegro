@@ -61,7 +61,16 @@ pub enum Expr {
     Cond(Vec<(Expr, Vec<Expr>)>),          // condition -> body
     With(Vec<(Pattern, Expr)>, Vec<Expr>, Option<Vec<CaseClause>>), // clauses, body, else
     Receive(Vec<CaseClause>, Option<Vec<Expr>>), // receive do clauses [after _ -> body] end
+    For(Vec<ForClause>, Vec<Expr>),        // for gen/filter clauses, do body — yields a list
     Pin(String),                           // ^var, only in pattern position
+}
+
+// A clause of a `for` comprehension: a generator `pat <- enumerable`, or a
+// boolean filter that skips the current combination when falsy.
+#[derive(Debug, Clone)]
+pub enum ForClause {
+    Gen(Pattern, Expr),
+    Filter(Expr),
 }
 
 // A `pattern [when guard] -> body` clause (case / with-else).
