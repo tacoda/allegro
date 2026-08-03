@@ -174,8 +174,8 @@ async function runCommand(spec: SystemSpec, graph: Graph, name: string, input?: 
 
 // Build the system, then run the spec's entrypoint.
 export async function runSystem(def: SystemDefinition): Promise<System> {
+  const sys = await buildSystem(def.spec); // registers hooks first
   await bus.fire("sessionStart");
-  const sys = await buildSystem(def.spec);
   if (def.spec.run) await def.spec.run(sys);
   await bus.fire("stop");
   return sys;

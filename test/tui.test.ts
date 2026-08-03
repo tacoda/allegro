@@ -9,12 +9,12 @@ beforeEach(() => bus.reset());
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
 
 test("TUI renders the node table, events, and spec output", async () => {
-  const { lastFrame } = render(React.createElement(App, { file: "examples/pipeline.ts" }));
+  const { lastFrame } = render(React.createElement(App, { file: "examples/04_pipeline.ts" }));
   await tick();
   const frame = lastFrame() ?? "";
   expect(frame).toContain("allegro");
   expect(frame).toContain("nodes");
   expect(frame).toContain("events");
-  // the offline pipeline branches to "big" then "small"
-  expect(frame).toContain("big");
+  // the offline pipeline transforms "  hello  " -> "HELLO!"
+  expect(frame).toContain("HELLO!");
 });

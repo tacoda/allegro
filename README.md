@@ -16,9 +16,13 @@ or a web UI.
 
 ```bash
 bun install
-bun run src/cli/main.ts run examples/pipeline.ts       # offline -> big / small
-OPENAI_API_KEY=sk-... bun run src/cli/main.ts run examples/triage.ts
+bun run src/cli/main.ts run examples/01_hello.ts           # -> Hello, world!
+bun run src/cli/main.ts run examples/09_triage.ts --mock   # agent example, canned backend
+OPENAI_API_KEY=sk-... bun run src/cli/main.ts run examples/09_triage.ts
 ```
+
+Every example runs two ways: `--mock` (a canned model backend, no key) or with a
+real `OPENAI_API_KEY` in the environment.
 
 ## A system is a typed spec
 
@@ -111,8 +115,28 @@ allegro help
 
 ```bash
 bun run build        # -> ./allegro  (self-contained; run/tui/web all work)
-./allegro run examples/pipeline.ts
+./allegro run examples/01_hello.ts
 ```
+
+## Examples
+
+Ordered by complexity. `01–07` are deterministic (no LLM); `08–12` are agents,
+runnable with `--mock` or a real key.
+
+| # | file | shows |
+|---|------|-------|
+| 01 | `01_hello.ts` | one `fn` node |
+| 02 | `02_branch.ts` | conditional router transition |
+| 03 | `03_loop.ts` | a transition that loops back |
+| 04 | `04_pipeline.ts` | chained `fn` stages |
+| 05 | `05_commands.ts` | user-facing `commands` |
+| 06 | `06_nested_graph.ts` | a `graph` node (recursive) |
+| 07 | `07_lifecycle_hooks.ts` | `sessionStart`/`stop` hooks |
+| 08 | `08_assistant.ts` | agent + tool + memory |
+| 09 | `09_triage.ts` | routing between agents |
+| 10 | `10_skill.ts` | skill composed into an agent |
+| 11 | `11_mcp.ts` | mcp node expanded to tools |
+| 12 | `12_capstone.ts` | router + tool + skill + memory + delegate + hook + command |
 
 ## Layout
 

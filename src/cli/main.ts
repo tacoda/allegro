@@ -13,7 +13,8 @@ usage:
   allegro web <spec> [--port <n>]                   run with the web UI
 
 flags:
-  --events   stream lifecycle events (agent/tool/hook/node) to stderr`;
+  --events   stream lifecycle events (agent/tool/hook/node) to stderr
+  --mock     use a canned model backend (no OPENAI_API_KEY needed)`;
 
 const HELP = new Set([undefined, "help", "-h", "--help"]);
 
@@ -48,7 +49,12 @@ async function main(): Promise<void> {
 async function cmdRun(argv: string[]): Promise<void> {
   const { positionals, values } = parseArgs({
     args: argv,
-    options: { events: { type: "boolean" }, command: { type: "string" }, input: { type: "string" } },
+    options: {
+      events: { type: "boolean" },
+      mock: { type: "boolean" },
+      command: { type: "string" },
+      input: { type: "string" },
+    },
     allowPositionals: true,
   });
   const file = positionals[0];
@@ -56,6 +62,7 @@ async function cmdRun(argv: string[]): Promise<void> {
     console.error("usage: allegro run <spec.ts|spec.json>");
     process.exit(2);
   }
+  if (values.mock) process.env.ALLEGRO_MOCK = "1";
   if (values.events) bus.subscribe((e) => console.error(formatEvent(e)));
 
   const def = await loadDefinition(file);

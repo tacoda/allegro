@@ -6,7 +6,7 @@ import { bus } from "../src/runtime/bus.ts";
 beforeEach(() => bus.reset());
 
 test("web server serves the page + client bundle and streams events", async () => {
-  const server = await createServer("examples/pipeline.ts", 0);
+  const server = await createServer("examples/04_pipeline.ts", 0);
   const base = `http://localhost:${server.port}`;
 
   const html = await (await fetch(`${base}/`)).text();
@@ -21,8 +21,8 @@ test("web server serves the page + client bundle and streams events", async () =
   // run the spec; its console output flows onto the event feed as "log" events
   const events: any[] = [];
   bus.subscribe((e) => events.push(e));
-  await runSystem(await loadDefinition("examples/pipeline.ts"));
-  expect(events.some((e) => e.type === "log" && e.message === "big")).toBe(true);
+  await runSystem(await loadDefinition("examples/04_pipeline.ts"));
+  expect(events.some((e) => e.type === "log" && e.message === "HELLO!")).toBe(true);
 
   server.stop(true);
 });

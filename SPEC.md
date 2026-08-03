@@ -137,6 +137,17 @@ export default defineSystem({
 
 ## Examples
 
-- `examples/pipeline.ts` — deterministic control flow: `fn` nodes, a router, a hook, a command *(offline)*
-- `examples/assistant.ts` — an agent with a tool and memory *(needs `OPENAI_API_KEY`)*
-- `examples/triage.ts` — a routing graph *(needs `OPENAI_API_KEY`)*
+Twelve, by complexity. `01–07` are deterministic (no LLM); `08–12` are agents,
+runnable with `--mock` (a canned backend, no key) or a real `OPENAI_API_KEY`.
+
+- `01_hello` · `02_branch` · `03_loop` · `04_pipeline` — `fn` nodes and routers
+- `05_commands` · `06_nested_graph` · `07_lifecycle_hooks` — commands, recursion, hooks
+- `08_assistant` — agent + tool + memory
+- `09_triage` — routing between agents
+- `10_skill` — skill composed into an agent
+- `11_mcp` — mcp node expanded to tools
+- `12_capstone` — router + tool + skill + memory + delegate + hook + command
+
+```bash
+allegro run examples/12_capstone.ts --mock
+```
