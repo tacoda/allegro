@@ -1,4 +1,4 @@
-import { runtime, type RuntimeEvent } from "../otp/index.ts";
+import { bus, type BusEvent } from "../runtime/bus.ts";
 import { loadDefinition, runSystem } from "../spec/index.ts";
 
 // Serve a React UI and stream the runtime's event feed to it over WebSocket. The
@@ -14,7 +14,7 @@ export async function runWeb(file?: string, port = 4173): Promise<void> {
   try {
     await runSystem(await loadDefinition(file));
   } catch (err: any) {
-    runtime.emit({ type: "log", message: `error: ${err?.message ?? err}` });
+    bus.emit({ type: "log", message: `error: ${err?.message ?? err}` });
   }
 }
 
@@ -22,17 +22,17 @@ export async function runWeb(file?: string, port = 4173): Promise<void> {
 // events so a client that connects mid- or post-run still sees the whole story.
 export async function createServer(file: string, port: number) {
   const clientJs = await bundleClient(file);
-  const history: RuntimeEvent[] = [];
+  const history: BusEvent[] = [];
   const sockets = new Set<any>();
 
-  runtime.subscribe((e) => {
+  bus.subscribe((e) => {
     history.push(e);
     const msg = JSON.stringify(e);
     for (const ws of sockets) ws.send(msg);
   });
 
   // Route the spec's console output onto the same event feed.
-  console.log = (...args: any[]) => runtime.emit({ type: "log", message: args.join(" ") });
+  console.log = (...args: any[]) => bus.emit({ type: "log", message: args.join(" ") });
 
   return Bun.serve({
     port,

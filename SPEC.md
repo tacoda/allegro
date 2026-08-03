@@ -1,116 +1,142 @@
 # allegro specs
 
-A spec is a **typed TypeScript module** that declares a system and exports it via
-`defineSystem`. Structure is data; behavior and the `run` entrypoint are inline
-TypeScript. Run it with `allegro run <spec.ts>` (or `tui` / `web`).
+**A system is a graph.** Every primitive is a **node**; nodes are wired by three
+kinds of edge:
+
+- **transitions** — control flow (which node runs next). Routers are plain code, so conditionals live here.
+- **uses** — dependencies (an agent's tools, skills, delegates, memory).
+- **triggers** — `commands` (user-fired) and `hooks` (event-fired).
+
+A spec is a typed TypeScript module exporting `defineSystem`. Structure is data;
+behavior (`run` bodies, transition routers, hook handlers, the `run` entrypoint)
+is inline TypeScript. Run it with `allegro run <spec.ts>` (or `tui` / `web`). A
+`.json` file is accepted for the behavior-free data subset.
 
 ```ts
 import { defineSystem } from "allegro";
-export default defineSystem({ /* ... */ });
+export default defineSystem({ nodes: { /* … */ }, transitions: { /* … */ } });
 ```
 
-A `.json` file is also accepted for the **behavior-free data subset** (no inline
-functions); the typed `.ts` form is the primary one.
+## Node types
 
-## Top-level keys
+Each entry under `nodes` has a `type`. References between nodes are by name.
 
-All optional. Primitives are keyed by name; the name becomes the accessor on the
-`sys` handle passed to `run`.
+| `type` | shape | role | LLM |
+|--------|-------|------|-----|
+| `tool` | `{ description, run }` | code capability, model-invoked | — |
+| `fn` | `{ run(msg) }` | deterministic flow step / control flow | no |
+| `memory` | `{ seed? }` | key/value store (adds remember/recall) | no |
+| `skill` | `{ description, instructions, uses? }` | instructions composed *into* an agent | no |
+| `agent` | `{ description?, system?, model?, temperature?, uses? }` | LLM actor; delegatable if it has `description` | yes |
+| `mcp` | `{ server, env?, tools? }` | external MCP server → expands to tools | — |
+| `graph` | `{ nodes, transitions }` | composite (recursive) | — |
 
-| Key           | Type                                   | Notes |
-|---------------|----------------------------------------|-------|
-| `memory`      | `Record<string, Record<string,string>>` | name → seed entries (`{}` for empty) |
-| `tools`       | `Record<string, ToolSpec>`             | `{ description, run }` |
-| `subagents`   | `Record<string, SubagentSpec>`         | `{ description, model?, system?, tools? }` |
-| `agents`      | `Record<string, AgentSpec>`            | `{ model?, system?, temperature?, tools?, subagents?, memory? }` |
-| `servers`     | `Record<string, GenServerClass>`       | a `class X extends GenServer` |
-| `graphs`      | `Record<string, GraphSpec>`            | `{ entry, nodes, edges }` |
-| `supervisors` | `Record<string, SupervisorSpec>`       | `{ strategy?, maxRestarts?, children }` |
-| `run`         | `(sys: System) => void \| Promise`     | drives the declared primitives |
+**Flow vs resource.** `agent`, `fn`, and `graph` are *flow* nodes — transitions
+route among them. `tool`, `skill`, `memory`, `mcp` are *resources* — referenced
+by an agent's `uses`, never routed to.
 
-References are by name: `agents.answer.tools: ["shout"]` points at
-`tools.shout`; graph `nodes` name agents; supervisor `children` name servers.
+## `uses` — dependency edges
 
-## Inline behavior
+One list per agent (and skill). Each name resolves by the target's type:
 
-| Where                     | Signature | Returns |
-|---------------------------|-----------|---------|
-| `tools.<t>.run`           | `(input: string)` | tool result (string) |
-| GenServer `handleCast`    | `(msg, state)` | new state |
-| GenServer `handleCall`    | `(msg, state)` | `this.reply(value, state)` |
-| GenServer `init`          | `(...args)` | initial state (defaults to first arg) |
-| graph edge router         | `(msg: Message)` | next node name, or `"end"` |
-| `run`                     | `(sys)` | — |
+- `tool` / `mcp` → a callable the model may invoke
+- `skill` → its `instructions` are prepended to the agent's system prompt, its tools folded in
+- `agent` → exposed as a delegation tool (its own call, own context) — this is what a "subagent" was
+- `memory` → attached as the agent's store
+
+```ts
+answer: { type: "agent", system: "Be concise.", uses: ["shout", "notes", "translator"] }
+```
+
+## `transitions` — flow edges
+
+`entry` names the first node; every other key maps a node to its next. A value is
+a target name, `"end"`, or a router `(msg) => nextName`. Routers are deterministic
+code — conditionals, switches, loops (route back to an earlier node).
+
+```ts
+transitions: {
+  entry: "triage",
+  triage: (msg) => (msg.content.includes("MATH") ? "answer" : "end"),
+  answer: "end",
+}
+```
+
+`"entry"` is reserved — don't name a node `entry`.
+
+## `commands` — user entrypoints
+
+Named ways to enter the graph from outside. `allegro run <spec> --command <name> [--input <s>]`, or `sys.command(name, input)`.
+
+```ts
+commands: { review: { target: "reviewer", description: "Review a PR", input?: "…" } }
+```
+
+## `hooks` — event triggers
+
+Fire on lifecycle events; a `preToolUse` hook may **block** or **replace** a tool
+call. `match` is a substring filter on the tool/agent name.
+
+```ts
+hooks: {
+  preToolUse: { match: "shell", run: (e) => e.input?.includes("rm -rf") ? { block: true, reason: "no" } : undefined },
+  postToolUse: { run: (e) => void log(e.tool) },
+}
+```
+
+Events: `sessionStart`, `userPromptSubmit`, `preToolUse`, `postToolUse`,
+`agentStart`, `agentFinish`, `stop`. Only `preToolUse` acts on the return value.
 
 ## `sys` — the built system
 
-`run(sys)` receives every declared primitive, instantiated and wired:
+`run(sys)` receives the instantiated system:
 
 ```ts
-sys.tools.shout          // Tool
-sys.memory.notes         // Memory
-sys.agents.triage        // Agent
-sys.subagents.translator // Subagent
-sys.graphs.desk          // Graph
-sys.supervisors.sup      // SupervisorRef  (.whichChildren())
-sys.servers.Counter      // the class (sys.start(sys.servers.Counter, 0))
-sys.start(Server, ...a)  // start a GenServer -> ServerRef
-sys.runtime              // the process runtime (subscribe to events)
+sys.run(input)          // trigger the root graph -> Message
+sys.command(name, in?)  // enter via a command -> Message
+sys.graph               // the root Graph
+sys.agents.answer       // Agent, by name
+sys.tools.shout         // Tool
+sys.memory.notes        // Memory
+sys.graphs.pipeline     // a nested graph node
+sys.nodes               // every instantiated node by name
 ```
 
 ## Reference
 
 ```ts
-import { defineSystem, GenServer } from "allegro";
-
-class Counter extends GenServer<number> {
-  init(n: number) { return n; }                       // optional
-  handleCast(_msg: string, s: number) { return s + 1; }
-  handleCall(_msg: string, s: number) { return this.reply(s, s); }
-}
+import { defineSystem } from "allegro";
 
 export default defineSystem({
-  memory: { notes: {} },
+  nodes: {
+    notes:      { type: "memory" },
+    shout:      { type: "tool", description: "Uppercase.", run: (i) => i.toUpperCase() },
+    translator: { type: "skill", description: "to French", instructions: "Translate replies to French." },
 
-  tools: {
-    shout: { description: "Uppercase the text.", run: (input) => input.toUpperCase() },
+    triage:     { type: "agent", system: "Reply MATH or OTHER." },
+    answer:     { type: "agent", system: "Be concise.", uses: ["shout", "notes", "translator"] },
+
+    parse:      { type: "fn", run: (m) => String(m.content.length) },
   },
 
-  subagents: {
-    translator: { description: "translate to French", system: "Translate to French." },
+  transitions: {
+    entry:  "triage",
+    triage: (msg) => (msg.content.includes("MATH") ? "answer" : "end"),
+    answer: "end",
   },
 
-  agents: {
-    triage: { system: "Reply MATH or OTHER." },
-    answer: { system: "Be concise.", tools: ["shout"], memory: "notes", subagents: ["translator"] },
-  },
+  commands: { ask: { target: "triage", description: "Ask the desk." } },
 
-  servers: { Counter },
-
-  supervisors: {
-    sup: { strategy: "one_for_one", maxRestarts: 5, children: [{ server: Counter, args: [0] }] },
-  },
-
-  graphs: {
-    desk: {
-      entry: "classify",
-      nodes: { classify: "triage", answer: "answer" },
-      edges: {
-        classify: (msg) => (msg.content.includes("MATH") ? "answer" : "end"),
-        answer: "end",
-      },
-    },
-  },
+  hooks: { stop: { run: () => void console.log("done") } },
 
   run: async (sys) => {
-    console.log((await sys.graphs.desk!.trigger("What is 2 + 2?")).content);
+    console.log((await sys.run("What is 2 + 2?")).content);
   },
 });
 ```
 
 ## Examples
 
-- `examples/counter.ts` — a GenServer *(offline)*
-- `examples/supervisor.ts` — crash isolation + restart *(offline)*
+- `examples/pipeline.ts` — deterministic control flow: `fn` nodes, a router, a hook, a command *(offline)*
 - `examples/assistant.ts` — an agent with a tool and memory *(needs `OPENAI_API_KEY`)*
 - `examples/triage.ts` — a routing graph *(needs `OPENAI_API_KEY`)*

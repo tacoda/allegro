@@ -1,57 +1,139 @@
 import { expect, test, beforeEach, afterEach } from "bun:test";
-import { buildSystem, runSystem } from "../src/spec/index.ts";
-import { defineSystem } from "../src/spec/index.ts";
-import { GenServer, runtime } from "../src/otp/index.ts";
+import { buildSystem } from "../src/spec/index.ts";
 import { setChatBackend } from "../src/agents/index.ts";
+import { bus } from "../src/runtime/bus.ts";
 
-beforeEach(() => runtime.reset());
+beforeEach(() => bus.reset());
 afterEach(() => setChatBackend(null));
 
-test("builds and wires tools, agents, and a graph", async () => {
+// A backend that echoes the last user message uppercased, calling no tools.
+function echoUpper() {
   setChatBackend(async (p) => {
     const user = String((p.messages.at(-1) as any).content);
-    return { message: { role: "assistant", content: user.toUpperCase() }, content: user.toUpperCase(), toolCalls: [] };
+    const content = user.toUpperCase();
+    return { message: { role: "assistant", content }, content, toolCalls: [] };
   });
+}
 
+test("wires tool + memory into an agent via uses; runs the root graph", async () => {
+  echoUpper();
   const sys = await buildSystem({
-    tools: { shout: { description: "up", run: (i) => i.toUpperCase() } },
-    agents: { bot: { system: "s", tools: ["shout"] } },
-    graphs: {
-      g: { entry: "a", nodes: { a: "bot" }, edges: { a: "end" } },
+    nodes: {
+      shout: { type: "tool", description: "up", run: (i) => i.toUpperCase() },
+      notes: { type: "memory" },
+      bot: { type: "agent", system: "s", uses: ["shout", "notes"] },
     },
+    transitions: { entry: "bot", bot: "end" },
   });
 
   expect(sys.tools.shout!.run("x")).toBe("X");
   expect((await sys.agents.bot!.run("hi")).content).toBe("HI");
-  expect((await sys.graphs.g!.trigger("yo")).content).toBe("YO");
+  expect((await sys.run("yo")).content).toBe("YO");
 });
 
-test("runs a GenServer + supervisor spec end to end", async () => {
-  class Worker extends GenServer<number> {
-    handleCall(msg: string, state: number) {
-      if (msg === "crash") throw new Error("boom");
-      return this.reply(state, state);
-    }
-  }
+test("fn nodes + conditional transitions run offline", async () => {
+  const sys = await buildSystem({
+    nodes: {
+      parse: { type: "fn", run: (m) => String(m.content.length) },
+      big: { type: "fn", run: () => "big" },
+      small: { type: "fn", run: () => "small" },
+    },
+    transitions: {
+      entry: "parse",
+      parse: (m) => (Number(m.content) > 3 ? "big" : "small"),
+      big: "end",
+      small: "end",
+    },
+  });
 
-  let restarted = false;
-  let finalId = -1;
+  expect((await sys.run("hello")).content).toBe("big");
+  expect((await sys.run("hi")).content).toBe("small");
+});
 
-  await runSystem(
-    defineSystem({
-      servers: { Worker },
-      supervisors: { sup: { children: [{ server: Worker, args: [7] }] } },
-      run: async (sys) => {
-        const w = sys.supervisors.sup!.whichChildren()[0]!;
-        await w.call("crash").catch(() => {});
-        await new Promise((r) => setTimeout(r, 10));
-        const w2 = sys.supervisors.sup!.whichChildren()[0]!;
-        restarted = w.pid !== w2.pid;
-        finalId = await w2.call("id");
+test("skill instructions inject into the agent's system prompt", async () => {
+  echoUpper();
+  const sys = await buildSystem({
+    nodes: {
+      poet: { type: "skill", description: "poetry", instructions: "Write in verse." },
+      bard: { type: "agent", system: "Base.", uses: ["poet"] },
+    },
+    transitions: { entry: "bard", bard: "end" },
+  });
+
+  expect(sys.agents.bard!.system).toContain("Write in verse.");
+  expect(sys.agents.bard!.system).toContain("Base.");
+});
+
+test("an agent used by another becomes a delegation tool", async () => {
+  echoUpper();
+  const sys = await buildSystem({
+    nodes: {
+      worker: { type: "agent", description: "does work", system: "w" },
+      boss: { type: "agent", system: "b", uses: ["worker"] },
+    },
+    transitions: { entry: "boss", boss: "end" },
+  });
+
+  expect(sys.agents.boss!.tools.map((t) => t.name)).toContain("worker");
+});
+
+test("a nested graph node runs as a single flow step", async () => {
+  const sys = await buildSystem({
+    nodes: {
+      inner: {
+        type: "graph",
+        nodes: { step: { type: "fn", run: (m) => `${m.content}!` } },
+        transitions: { entry: "step", step: "end" },
       },
-    }),
-  );
+    },
+    transitions: { entry: "inner", inner: "end" },
+  });
 
-  expect(restarted).toBe(true);
-  expect(finalId).toBe(7);
+  expect((await sys.run("hi")).content).toBe("hi!");
+});
+
+test("a preToolUse hook can block a tool call", async () => {
+  let called = 0;
+  setChatBackend(async (p) => {
+    const sawTool = p.messages.some((m: any) => m.role === "tool");
+    if (!sawTool) {
+      return {
+        message: { role: "assistant", content: null },
+        content: "",
+        toolCalls: [{ id: "1", name: "danger", args: { input: "x" } }],
+      };
+    }
+    const toolMsg: any = p.messages.find((m: any) => m.role === "tool");
+    return { message: { role: "assistant", content: String(toolMsg.content) }, content: String(toolMsg.content), toolCalls: [] };
+  });
+
+  const sys = await buildSystem({
+    nodes: {
+      danger: {
+        type: "tool",
+        description: "d",
+        run: () => {
+          called++;
+          return "ran";
+        },
+      },
+      bot: { type: "agent", system: "s", uses: ["danger"] },
+    },
+    transitions: { entry: "bot", bot: "end" },
+    hooks: { preToolUse: { match: "danger", run: () => ({ block: true, reason: "nope" }) } },
+  });
+
+  const out = await sys.agents.bot!.run("go");
+  expect(called).toBe(0);
+  expect(out.content).toContain("blocked");
+});
+
+test("a command enters the graph at its target node", async () => {
+  const sys = await buildSystem({
+    nodes: { echo: { type: "fn", run: (m) => `got:${m.content}` } },
+    transitions: { entry: "echo", echo: "end" },
+    commands: { go: { target: "echo" } },
+  });
+
+  expect((await sys.command("go", "hey")).content).toBe("got:hey");
 });

@@ -1,18 +1,19 @@
 #!/usr/bin/env bun
 import { parseArgs } from "util";
-import { runtime } from "../otp/index.ts";
-import { loadDefinition, runSystem } from "../spec/index.ts";
+import { bus } from "../runtime/bus.ts";
+import { loadDefinition, runSystem, buildSystem } from "../spec/index.ts";
 import { formatEvent } from "../ui/format.ts";
 
-const USAGE = `allegro — agentic systems on an OTP-style process runtime
+const USAGE = `allegro — a system is a graph: nodes, transitions, triggers
 
 usage:
-  allegro run <spec.ts|spec.json> [--events]   run a system headless
-  allegro tui <spec>                            run with the terminal UI
-  allegro web <spec> [--port <n>]               run with the web UI
+  allegro run <spec.ts|spec.json> [--events]        run a system headless
+  allegro run <spec> --command <name> [--input <s>] invoke a command
+  allegro tui <spec>                                run with the terminal UI
+  allegro web <spec> [--port <n>]                   run with the web UI
 
 flags:
-  --events   stream runtime events (spawn/exit/restart/agent) to stderr`;
+  --events   stream lifecycle events (agent/tool/hook/node) to stderr`;
 
 const HELP = new Set([undefined, "help", "-h", "--help"]);
 
@@ -47,7 +48,7 @@ async function main(): Promise<void> {
 async function cmdRun(argv: string[]): Promise<void> {
   const { positionals, values } = parseArgs({
     args: argv,
-    options: { events: { type: "boolean" } },
+    options: { events: { type: "boolean" }, command: { type: "string" }, input: { type: "string" } },
     allowPositionals: true,
   });
   const file = positionals[0];
@@ -55,8 +56,16 @@ async function cmdRun(argv: string[]): Promise<void> {
     console.error("usage: allegro run <spec.ts|spec.json>");
     process.exit(2);
   }
-  if (values.events) runtime.subscribe((e) => console.error(formatEvent(e)));
-  await runSystem(await loadDefinition(file));
+  if (values.events) bus.subscribe((e) => console.error(formatEvent(e)));
+
+  const def = await loadDefinition(file);
+  if (values.command) {
+    const sys = await buildSystem(def.spec);
+    const out = await sys.command(values.command, values.input);
+    console.log(out.content);
+    return;
+  }
+  await runSystem(def);
 }
 
 function specArg(argv: string[]): string {

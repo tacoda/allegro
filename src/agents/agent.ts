@@ -2,46 +2,46 @@ import { chat, defaultModel } from "./openai.ts";
 import { Message } from "./message.ts";
 import { Memory } from "./memory.ts";
 import { Model, Tool } from "./tool.ts";
-import type { Subagent } from "./subagent.ts";
-import { runtime, Runtime } from "../otp/runtime.ts";
+import { bus } from "../runtime/bus.ts";
 
 export interface AgentConfig {
   name?: string;
+  description?: string; // present => delegatable by other agents
   model?: string | Model;
   system?: string;
   temperature?: number;
   tools?: Tool[];
   memory?: Memory;
-  subagents?: Subagent[];
 }
 
 const MAX_TOOL_STEPS = 8;
 
-// An LLM plus the machinery around it: a system prompt, callable tools, an
-// optional memory, and named subagents it can delegate to. `run` returns a
-// Message; the run loops until the model stops calling tools.
+// An LLM plus its system prompt, callable tools, and optional memory. Skills and
+// delegated agents are folded into `system`/`tools` at build time, so the agent
+// itself only ever sees tools + a prompt. `run` loops until the model stops
+// calling tools. Tool calls pass through preToolUse/postToolUse hooks.
 export class Agent {
   name: string;
+  description?: string;
   model: string;
   temperature: number;
   system: string;
   tools: Tool[];
   memory?: Memory;
-  subagents: Map<string, Subagent>;
 
-  constructor(cfg: AgentConfig = {}, private rt: Runtime = runtime) {
+  constructor(cfg: AgentConfig = {}) {
     this.name = cfg.name ?? "agent";
+    this.description = cfg.description;
     const model = cfg.model;
     this.model = typeof model === "string" ? model : (model?.name ?? defaultModel());
     this.temperature = cfg.temperature ?? (model instanceof Model ? model.temperature : 0.7);
     this.system = cfg.system ?? "";
     this.tools = cfg.tools ?? [];
     this.memory = cfg.memory;
-    this.subagents = new Map((cfg.subagents ?? []).map((s) => [s.name, s]));
   }
 
   async run(input: string): Promise<Message> {
-    this.rt.emit({ type: "agent", phase: "start", name: this.name, text: input });
+    await bus.fire("agentStart", { agent: this.name, input });
     const messages: any[] = [];
     if (this.system) messages.push({ role: "system", content: this.system });
     messages.push({ role: "user", content: input });
@@ -55,7 +55,7 @@ export class Agent {
         tools: schemas.length ? schemas : undefined,
       });
       if (res.toolCalls.length === 0) {
-        this.rt.emit({ type: "agent", phase: "finish", name: this.name, text: res.content });
+        await bus.fire("agentFinish", { agent: this.name, output: res.content });
         return new Message(res.content, "assistant", this.name);
       }
       messages.push(res.message);
@@ -77,12 +77,6 @@ export class Agent {
     return Promise.all(inputs.map((i) => this.run(i)));
   }
 
-  async delegate(name: string, input: string): Promise<Message> {
-    const sub = this.subagents.get(name);
-    if (!sub) throw new Error(`no subagent named '${name}'`);
-    return sub.run(input);
-  }
-
   private toolSchemas(): any[] {
     const schemas: any[] = this.tools.map((t) => t.schema());
     if (this.memory) {
@@ -93,6 +87,17 @@ export class Agent {
   }
 
   private async invokeTool(name: string, args: any): Promise<string> {
+    const input = String(args.input ?? "");
+    const decision = await bus.fire("preToolUse", { agent: this.name, tool: name, input });
+    if (decision && "block" in decision) return `blocked: ${decision.reason ?? "denied by hook"}`;
+    const effective = decision && "replace" in decision ? decision.replace : input;
+
+    const output = await this.dispatchTool(name, args, effective);
+    await bus.fire("postToolUse", { agent: this.name, tool: name, input: effective, output });
+    return output;
+  }
+
+  private async dispatchTool(name: string, args: any, input: string): Promise<string> {
     if (this.memory && name === "remember") {
       return this.memory.remember(String(args.key), String(args.value));
     }
@@ -101,7 +106,7 @@ export class Agent {
     }
     const tool = this.tools.find((t) => t.name === name);
     if (!tool) return `error: no tool '${name}'`;
-    return tool.run(String(args.input ?? ""));
+    return tool.run(input);
   }
 }
 

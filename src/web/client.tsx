@@ -1,12 +1,12 @@
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import type { RuntimeEvent } from "../otp/runtime.ts";
-import { applyEvent, formatEvent, type ProcRow } from "../ui/format.ts";
+import type { BusEvent } from "../runtime/bus.ts";
+import { applyEvent, formatEvent, type NodeRow } from "../ui/format.ts";
 
 declare const SPEC_FILE: string;
 
 function App() {
-  const [procs, setProcs] = useState<Map<number, ProcRow>>(new Map());
+  const [procs, setProcs] = useState<Map<string, NodeRow>>(new Map());
   const [log, setLog] = useState<string[]>([]);
   const [output, setOutput] = useState<string[]>([]);
   const [connected, setConnected] = useState(false);
@@ -16,10 +16,10 @@ function App() {
     ws.onopen = () => setConnected(true);
     ws.onclose = () => setConnected(false);
     ws.onmessage = (ev) => {
-      const e: RuntimeEvent = JSON.parse(ev.data);
+      const e: BusEvent = JSON.parse(ev.data);
       setProcs((prev) => applyEvent(prev, e));
       setLog((prev) => [...prev, formatEvent(e)].slice(-200));
-      if (e.type === "log") setOutput((prev) => [...prev, e.message].slice(-200));
+      if (e.type === "log") setOutput((prev) => [...prev, e.message ?? ""].slice(-200));
     };
     return () => ws.close();
   }, []);
@@ -33,10 +33,10 @@ function App() {
       </header>
       <div className="cols">
         <section className="procs">
-          <h2>processes</h2>
-          {[...procs.values()].map((p) => (
-            <div key={p.pid} className={`proc ${p.status}`}>
-              <span className="glyph">{p.status === "alive" ? "●" : "✗"}</span> #{p.pid} {p.kind}
+          <h2>nodes</h2>
+          {[...procs.values()].map((n) => (
+            <div key={n.name} className={`proc ${n.status}`}>
+              <span className="glyph">{n.status === "running" ? "●" : "✓"}</span> {n.name} {n.kind}
             </div>
           ))}
           {procs.size === 0 && <div className="muted">(none)</div>}

@@ -1,108 +1,183 @@
-import { Agent, Tool, Memory, Subagent, Graph, type GraphNode } from "../agents/index.ts";
-import { Supervisor, child, runtime, type Runtime } from "../otp/index.ts";
-import type { System, SystemDefinition, SystemSpec, GraphSpec } from "./define.ts";
+import { Agent, Tool, Memory, Graph, type GraphNode, type GraphEdge } from "../agents/index.ts";
+import { expandMcp } from "../agents/mcp.ts";
+import { bus } from "../runtime/bus.ts";
+import type { System, SystemDefinition, SystemSpec, SpecNode, Transitions, HookEvent } from "./define.ts";
 
-const entries = <V>(o: Record<string, V> | undefined): [string, V][] => Object.entries(o ?? {});
-
-// Instantiate and wire every primitive a spec declares, in dependency order, and
-// return the System handle. Does not call the spec's `run`.
-export async function buildSystem(spec: SystemSpec, rt: Runtime = runtime): Promise<System> {
-  const memory = buildMemory(spec);
-  const tools = buildTools(spec);
-  const subagents = buildSubagents(spec, tools);
-  const agents = buildAgents(spec, { tools, subagents, memory, rt });
-  const graphs = buildGraphs(spec, agents, subagents);
-  const supervisors = await buildSupervisors(spec, rt);
-
-  return {
-    tools,
-    memory,
-    subagents,
-    agents,
-    graphs,
-    supervisors,
-    servers: spec.servers ?? {},
-    start: (server, ...args) => server.start(...args),
-    runtime: rt,
-  };
-}
-
-function buildMemory(spec: SystemSpec): Record<string, Memory> {
-  return fromEntries(entries(spec.memory), (seed) => new Memory(Object.keys(seed).length ? seed : undefined));
-}
-
-function buildTools(spec: SystemSpec): Record<string, Tool> {
-  return fromEntries(entries(spec.tools), (cfg, name) => new Tool({ name, description: cfg.description, run: cfg.run }));
-}
-
-function buildSubagents(spec: SystemSpec, tools: Record<string, Tool>): Record<string, Subagent> {
-  return fromEntries(
-    entries(spec.subagents),
-    (cfg, name) =>
-      new Subagent({ name, description: cfg.description, model: cfg.model, system: cfg.system, tools: pick(tools, cfg.tools) }),
-  );
-}
-
-interface AgentDeps {
-  tools: Record<string, Tool>;
-  subagents: Record<string, Subagent>;
-  memory: Record<string, Memory>;
-  rt: Runtime;
-}
-
-function buildAgents(spec: SystemSpec, deps: AgentDeps): Record<string, Agent> {
-  return fromEntries(
-    entries(spec.agents),
-    (cfg, name) =>
-      new Agent(
-        {
-          name,
-          model: cfg.model,
-          system: cfg.system,
-          temperature: cfg.temperature,
-          tools: pick(deps.tools, cfg.tools),
-          memory: cfg.memory ? deps.memory[cfg.memory] : undefined,
-          subagents: pick(deps.subagents, cfg.subagents),
-        },
-        deps.rt,
-      ),
-  );
-}
-
-function buildGraphs(
-  spec: SystemSpec,
-  agents: Record<string, Agent>,
-  subagents: Record<string, Subagent>,
-): Record<string, Graph> {
-  return fromEntries(
-    entries(spec.graphs),
-    (g) => new Graph({ entry: g.entry, nodes: resolveNodes(g, agents, subagents), edges: g.edges }),
-  );
-}
-
-async function buildSupervisors(spec: SystemSpec, rt: Runtime): Promise<System["supervisors"]> {
-  const supervisors: System["supervisors"] = {};
-  for (const [name, s] of entries(spec.supervisors)) {
-    const children = s.children.map((c) => ("server" in c ? child(c.server, ...(c.args ?? [])) : child(c)));
-    supervisors[name] = await Supervisor.start({ strategy: s.strategy, maxRestarts: s.maxRestarts, children }, rt);
+// Instantiate every node a spec declares and wire the edges, returning the
+// System handle. Does not call the spec's `run`.
+export async function buildSystem(spec: SystemSpec): Promise<System> {
+  bus.clearHooks();
+  for (const [event, hook] of Object.entries(spec.hooks ?? {})) {
+    bus.register(event as HookEvent, hook!);
   }
-  return supervisors;
+
+  const scope = await buildScope(spec.nodes, spec.transitions);
+
+  const system: System = {
+    nodes: scope.all,
+    tools: scope.tools,
+    memory: scope.memory,
+    agents: scope.agents,
+    graphs: scope.graphs,
+    graph: scope.graph,
+    run: (input) => scope.graph.trigger(input),
+    command: (name, input) => runCommand(spec, scope.graph, name, input),
+  };
+  return system;
 }
 
-function pick<T>(all: Record<string, T>, names?: string[]): T[] {
-  return (names ?? []).map((n) => all[n]).filter(Boolean) as T[];
+interface Scope {
+  graph: Graph;
+  all: Record<string, unknown>;
+  tools: Record<string, Tool>;
+  memory: Record<string, Memory>;
+  agents: Record<string, Agent>;
+  graphs: Record<string, Graph>;
 }
 
-function fromEntries<V, T>(pairs: [string, V][], make: (value: V, name: string) => T): Record<string, T> {
-  const out: Record<string, T> = {};
-  for (const [name, value] of pairs) out[name] = make(value, name);
+interface Skill {
+  instructions: string;
+  uses: string[];
+}
+
+interface ResolveCtx {
+  tools: Record<string, Tool>;
+  mcpTools: Record<string, Tool[]>;
+  memory: Record<string, Memory>;
+  skills: Record<string, Skill>;
+  agents: Record<string, Agent>;
+}
+
+// Build one nodes+transitions scope into a runnable Graph. Recurses for nested
+// `type:"graph"` nodes. Resources (tool/skill/memory/mcp) become dependencies;
+// flow nodes (agent/fn/graph) become the graph's routable nodes.
+async function buildScope(specNodes: Record<string, SpecNode>, transitions: Transitions): Promise<Scope> {
+  const ctx = await buildResources(specNodes);
+  buildAgentShells(specNodes, ctx.agents); // pass 1: so delegation can name any agent
+  wireAgents(specNodes, ctx); // pass 2: resolve `uses`
+  const { flow, graphs } = await buildFlow(specNodes, ctx.agents);
+
+  const { entry, ...edges } = transitions;
+  const graph = new Graph({ entry, nodes: flow, edges: edges as Record<string, GraphEdge> });
+  const all: Record<string, unknown> = { ...ctx.tools, ...ctx.memory, ...ctx.agents, ...graphs };
+  return { graph, all, tools: ctx.tools, memory: ctx.memory, agents: ctx.agents, graphs };
+}
+
+// Resources: tools, memory, skills, mcp (async expand). Agents added later.
+async function buildResources(specNodes: Record<string, SpecNode>): Promise<ResolveCtx> {
+  const ctx: ResolveCtx = { tools: {}, mcpTools: {}, memory: {}, skills: {}, agents: {} };
+  for (const [name, node] of Object.entries(specNodes)) {
+    if (node.type === "tool") ctx.tools[name] = new Tool({ name, description: node.description, run: node.run });
+    else if (node.type === "memory") ctx.memory[name] = new Memory(seedOf(node.seed));
+    else if (node.type === "skill") ctx.skills[name] = { instructions: node.instructions, uses: node.uses ?? [] };
+    else if (node.type === "mcp") ctx.mcpTools[name] = await expandMcp({ prefix: name, server: node.server, env: node.env, tools: node.tools });
+  }
+  return ctx;
+}
+
+function seedOf(seed?: Record<string, string>): Record<string, string> | undefined {
+  return seed && Object.keys(seed).length ? seed : undefined;
+}
+
+function buildAgentShells(specNodes: Record<string, SpecNode>, agents: Record<string, Agent>): void {
+  for (const [name, node] of Object.entries(specNodes)) {
+    if (node.type !== "agent") continue;
+    agents[name] = new Agent({
+      name,
+      description: node.description,
+      model: node.model,
+      system: node.system ?? "",
+      temperature: node.temperature,
+    });
+  }
+}
+
+function wireAgents(specNodes: Record<string, SpecNode>, ctx: ResolveCtx): void {
+  for (const [name, node] of Object.entries(specNodes)) {
+    if (node.type !== "agent") continue;
+    const resolved = resolveUses(node.uses ?? [], ctx, name);
+    const agent = ctx.agents[name]!;
+    agent.tools = resolved.tools;
+    agent.memory = resolved.memory;
+    agent.system = [resolved.instructions.join("\n\n"), node.system ?? ""].filter(Boolean).join("\n\n");
+  }
+}
+
+// Flow nodes routable by transitions: agents, fns, nested graphs.
+async function buildFlow(
+  specNodes: Record<string, SpecNode>,
+  agents: Record<string, Agent>,
+): Promise<{ flow: Record<string, GraphNode>; graphs: Record<string, Graph> }> {
+  const flow: Record<string, GraphNode> = {};
+  const graphs: Record<string, Graph> = {};
+  for (const [name, node] of Object.entries(specNodes)) {
+    if (node.type === "agent") flow[name] = agents[name]!;
+    else if (node.type === "fn") flow[name] = node.run;
+    else if (node.type === "graph") {
+      const sub = await buildScope(node.nodes, node.transitions);
+      graphs[name] = sub.graph;
+      flow[name] = sub.graph;
+    }
+  }
+  return { flow, graphs };
+}
+
+// Turn an agent's `uses` names into concrete tools, injected skill instructions,
+// and an attached memory. Dispatch is by what the name resolves to.
+function resolveUses(
+  names: string[],
+  ctx: ResolveCtx,
+  owner: string,
+): { tools: Tool[]; instructions: string[]; memory?: Memory } {
+  const tools: Tool[] = [];
+  const instructions: string[] = [];
+  let memory: Memory | undefined;
+
+  for (const name of names) {
+    if (ctx.tools[name]) tools.push(ctx.tools[name]!);
+    else if (ctx.mcpTools[name]) tools.push(...ctx.mcpTools[name]!);
+    else if (ctx.skills[name]) {
+      instructions.push(ctx.skills[name]!.instructions);
+      tools.push(...skillTools(ctx.skills[name]!, ctx));
+    } else if (ctx.agents[name]) tools.push(delegationTool(ctx.agents[name]!));
+    else if (ctx.memory[name]) memory = ctx.memory[name];
+    else throw new Error(`node '${owner}' uses unknown node '${name}'`);
+  }
+  return { tools, instructions, memory };
+}
+
+function skillTools(skill: Skill, ctx: ResolveCtx): Tool[] {
+  const out: Tool[] = [];
+  for (const t of skill.uses) {
+    if (ctx.tools[t]) out.push(ctx.tools[t]!);
+    else if (ctx.mcpTools[t]) out.push(...ctx.mcpTools[t]!);
+  }
   return out;
 }
 
+// Expose an agent to a caller as a callable tool (its own call, own context).
+function delegationTool(agent: Agent): Tool {
+  return new Tool({
+    name: agent.name,
+    description: agent.description ?? `Delegate a task to ${agent.name}.`,
+    run: (input) => agent.run(input).then((m) => m.content),
+  });
+}
+
+async function runCommand(spec: SystemSpec, graph: Graph, name: string, input?: string) {
+  const cmd = spec.commands?.[name];
+  if (!cmd) throw new Error(`no command named '${name}'`);
+  const text = input ?? cmd.input ?? "";
+  bus.emit({ type: "command", agent: name, input: text });
+  return graph.trigger(text, cmd.target);
+}
+
 // Build the system, then run the spec's entrypoint.
-export async function runSystem(def: SystemDefinition, rt: Runtime = runtime): Promise<System> {
-  const sys = await buildSystem(def.spec, rt);
+export async function runSystem(def: SystemDefinition): Promise<System> {
+  await bus.fire("sessionStart");
+  const sys = await buildSystem(def.spec);
   if (def.spec.run) await def.spec.run(sys);
+  await bus.fire("stop");
   return sys;
 }
 
@@ -116,22 +191,4 @@ export async function loadDefinition(path: string): Promise<SystemDefinition> {
   const mod = await import(path.startsWith("/") ? path : `${process.cwd()}/${path}`);
   if (!mod.default) throw new Error(`${path} has no default export (use \`export default defineSystem(...)\`)`);
   return mod.default as SystemDefinition;
-}
-
-function resolveNodes(
-  g: GraphSpec,
-  agents: Record<string, Agent>,
-  subagents: Record<string, Subagent>,
-): Record<string, GraphNode> {
-  const nodes: Record<string, GraphNode> = {};
-  for (const [name, node] of Object.entries(g.nodes)) {
-    if (typeof node === "string") {
-      const resolved = agents[node] ?? subagents[node];
-      if (!resolved) throw new Error(`graph node '${name}' references unknown agent '${node}'`);
-      nodes[name] = resolved;
-    } else {
-      nodes[name] = node;
-    }
-  }
-  return nodes;
 }

@@ -1,15 +1,15 @@
 import React, { useEffect, useState } from "react";
 import { Box, Text, useApp, useInput, useStdin } from "ink";
-import { runtime } from "../otp/index.ts";
+import { bus } from "../runtime/bus.ts";
 import { loadDefinition, runSystem } from "../spec/index.ts";
-import { applyEvent, formatEvent, type ProcRow } from "../ui/format.ts";
+import { applyEvent, formatEvent, type NodeRow } from "../ui/format.ts";
 
 type Status = "running" | "done" | "error";
 
 export function App({ file }: { file: string }) {
   const { exit } = useApp();
   const { isRawModeSupported } = useStdin();
-  const [procs, setProcs] = useState<Map<number, ProcRow>>(new Map());
+  const [procs, setProcs] = useState<Map<string, NodeRow>>(new Map());
   const [log, setLog] = useState<string[]>([]);
   const [output, setOutput] = useState<string[]>([]);
   const [status, setStatus] = useState<Status>("running");
@@ -18,7 +18,7 @@ export function App({ file }: { file: string }) {
   useInput((input) => input === "q" && exit(), { isActive: isRawModeSupported });
 
   useEffect(() => {
-    const unsub = runtime.subscribe((e) => {
+    const unsub = bus.subscribe((e) => {
       setProcs((prev) => applyEvent(prev, e));
       setLog((prev) => [...prev, formatEvent(e)].slice(-12));
     });
@@ -48,7 +48,7 @@ export function App({ file }: { file: string }) {
         allegro · {file}
       </Text>
       <Box marginTop={1}>
-        <Processes procs={procs} />
+        <Nodes rows={procs} />
         <Panel title="events" lines={log} flexGrow={1} />
       </Box>
       <Panel title="output" lines={output} color="yellow" marginTop={1} />
@@ -57,19 +57,19 @@ export function App({ file }: { file: string }) {
   );
 }
 
-function Processes({ procs }: { procs: Map<number, ProcRow> }) {
-  const rows = [...procs.values()];
+function Nodes({ rows }: { rows: Map<string, NodeRow> }) {
+  const list = [...rows.values()];
   return (
     <Box flexDirection="column" marginRight={3} minWidth={22}>
       <Text bold underline>
-        processes
+        nodes
       </Text>
-      {rows.map((p) => (
-        <Text key={p.pid} color={p.status === "alive" ? "cyan" : "gray"}>
-          {p.status === "alive" ? "●" : "✗"} #{p.pid} {p.kind}
+      {list.map((n) => (
+        <Text key={n.name} color={n.status === "running" ? "cyan" : "gray"}>
+          {n.status === "running" ? "●" : "✓"} {n.name} {n.kind}
         </Text>
       ))}
-      {rows.length === 0 && <Text color="gray">(none)</Text>}
+      {list.length === 0 && <Text color="gray">(none)</Text>}
     </Box>
   );
 }

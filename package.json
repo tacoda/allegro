@@ -1,7 +1,7 @@
 {
   "name": "allegro",
   "version": "0.1.0",
-  "description": "A Bun/TypeScript toolkit for agentic systems on an OTP-style process runtime.",
+  "description": "A Bun/TypeScript toolkit for agentic systems modeled as a graph: nodes, transitions, dependencies, and triggers.",
   "type": "module",
   "module": "src/index.ts",
   "bin": {

@@ -1,27 +1,22 @@
-// A routing graph — classify, then answer only if it looks like math. An edge is
-// a target node name or a router function returning the next node.
+// A routing graph — classify, then answer only if it looks like math. A
+// transition is a target node name or a router (deterministic code) returning
+// the next node; `"end"` stops.
 //
 //   OPENAI_API_KEY=sk-... allegro run examples/triage.ts
 
 import { defineSystem } from "../src/index.ts";
 
 export default defineSystem({
-  agents: {
-    triage: { system: "Reply with exactly MATH or OTHER." },
-    responder: { system: "Answer the question concisely." },
+  nodes: {
+    triage: { type: "agent", system: "Reply with exactly MATH or OTHER." },
+    responder: { type: "agent", system: "Answer the question concisely." },
   },
-  graphs: {
-    desk: {
-      entry: "classify",
-      nodes: { classify: "triage", answer: "responder" },
-      edges: {
-        classify: (msg) => (msg.content.includes("MATH") ? "answer" : "end"),
-        answer: "end",
-      },
-    },
+  transitions: {
+    entry: "triage",
+    triage: (msg) => (msg.content.includes("MATH") ? "responder" : "end"),
+    responder: "end",
   },
   run: async (sys) => {
-    const out = await sys.graphs.desk!.trigger("What is 2 + 2?");
-    console.log(out.content);
+    console.log((await sys.run("What is 2 + 2?")).content);
   },
 });

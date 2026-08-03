@@ -1,92 +1,83 @@
 # allegro
 
-A Bun/TypeScript toolkit for building **agentic systems** on an **OTP-style
-process runtime**. Declare a system as a typed spec, then run it three ways — a
-headless CLI, a terminal UI, or a web UI.
+A Bun/TypeScript toolkit for building **agentic systems** as a **graph**. Declare
+a system as a typed spec, then run it three ways — a headless CLI, a terminal UI,
+or a web UI.
 
-- **Agentic primitives** — Agent, Tool, Memory, Subagent, Graph, backed by the
-  OpenAI API.
-- **OTP process model** — GenServer, Supervisor, Registry, Task, spawn/send,
-  monitor + restart-on-crash, on green threads (the JS event loop).
+- **A system is a graph.** Every primitive is a **node** (`tool`, `fn`, `memory`,
+  `skill`, `agent`, `mcp`, `graph`); nodes are wired by **transitions** (flow),
+  **uses** (dependencies), and **triggers** (`commands` + `hooks`).
+- **Deterministic where it should be.** `fn` nodes and router transitions are
+  plain code — no LLM call unless a node is an `agent`.
+- **The Claude primitive set.** agents, tools, skills, memory, commands, hooks,
+  MCP servers — all as graph nodes and edges.
 - **One typed spec, three surfaces** — `run` (headless), `tui` (Ink), `web`
-  (`Bun.serve` + React), all fed by one runtime event stream.
+  (`Bun.serve` + React), all fed by one lifecycle event stream.
 
 ```bash
 bun install
-bun run src/cli/main.ts run examples/counter.ts        # -> 3
+bun run src/cli/main.ts run examples/pipeline.ts       # offline -> big / small
 OPENAI_API_KEY=sk-... bun run src/cli/main.ts run examples/triage.ts
 ```
 
 ## A system is a typed spec
 
 ```ts
-import { defineSystem, GenServer } from "allegro";
-
-class Counter extends GenServer<number> {
-  handleCast(_msg: string, state: number) { return state + 1; }
-  handleCall(_msg: string, state: number) { return this.reply(state, state); }
-}
+import { defineSystem } from "allegro";
 
 export default defineSystem({
-  tools:  { shout: { description: "uppercase text", run: (input) => input.toUpperCase() } },
-  agents: { triage: { system: "reply MATH or OTHER" },
-            answer: { system: "be concise", tools: ["shout"] } },
-  servers: { Counter },
-  supervisors: { sup: { strategy: "one_for_one", children: [{ server: Counter, args: [0] }] } },
-  graphs: {
-    desk: {
-      entry: "classify",
-      nodes: { classify: "triage", answer: "answer" },
-      edges: { classify: (m) => (m.content.includes("MATH") ? "answer" : "end"), answer: "end" },
-    },
+  nodes: {
+    notes:  { type: "memory" },
+    shout:  { type: "tool", description: "uppercase text", run: (i) => i.toUpperCase() },
+    triage: { type: "agent", system: "reply MATH or OTHER" },
+    answer: { type: "agent", system: "be concise", uses: ["shout", "notes"] },
+    size:   { type: "fn", run: (m) => String(m.content.length) },  // deterministic, no LLM
+  },
+  transitions: {
+    entry:  "triage",
+    triage: (m) => (m.content.includes("MATH") ? "answer" : "end"),
+    answer: "end",
+  },
+  commands: { ask: { target: "triage", description: "Ask the desk." } },
+  hooks: {
+    preToolUse: { match: "shout", run: (e) => (e.input === "" ? { block: true } : undefined) },
   },
   run: async (sys) => {
-    const c = sys.supervisors.sup!.whichChildren()[0]!;
-    c.cast("inc");
-    console.log(await c.call("get"));               // 1
-    console.log((await sys.graphs.desk!.trigger("What is 2 + 2?")).content);
+    console.log((await sys.run("What is 2 + 2?")).content);
   },
 });
 ```
 
-Structure is data; behavior (tool bodies, graph routers, GenServer callbacks) and
-`run` are inline TypeScript. Full schema in **[SPEC.md](SPEC.md)**.
+Structure is data; behavior (tool/fn bodies, transition routers, hook handlers)
+and `run` are inline TypeScript. Full schema in **[SPEC.md](SPEC.md)**.
+
+## The graph model
+
+| Kind | What | How |
+|------|------|-----|
+| **nodes** | vertices — the primitives | `tool` `fn` `memory` `skill` `agent` `mcp` `graph` |
+| **transitions** | control flow (next node) | `entry` + name → name \| `"end"` \| `(msg) => next` |
+| **uses** | dependencies (agent → tool/skill/agent/mcp/memory) | inline `uses: [...]` |
+| **commands** | user-fired entrypoints | `{ target, description?, input? }` |
+| **hooks** | event-fired interceptors (can block) | `{ match?, run(ev) }` per event |
+
+An `agent` with a `description` that another agent `uses` becomes a **delegate**
+(its own call, own context) — that's what a "subagent" was. A `skill`'s
+instructions compose *into* an agent's prompt. A `graph` node nests recursively.
 
 ## Three surfaces
 
 ```bash
-allegro run <spec.ts> [--events]   # headless; --events streams the runtime feed
-allegro tui <spec.ts>              # terminal UI: process table, events, output
-allegro web <spec.ts> [--port n]   # web UI at http://localhost:4173
+allegro run <spec.ts> [--events]                 # headless; --events streams the feed
+allegro run <spec.ts> --command <name> [--input] # invoke a command
+allegro tui <spec.ts>                            # terminal UI: nodes, events, output
+allegro web <spec.ts> [--port n]                 # web UI at http://localhost:4173
 ```
 
-All three consume the **same runtime event stream** (`spawn`/`exit`/`restart`/
-`agent`/`log`) — the CLI prints it, the TUI (Ink) and web (React) render it.
-
-## OTP process model
-
-The JavaScript event loop **is** the cooperative green-thread scheduler:
-`await` yields, `.call` awaits a reply promise, a crash is a caught `throw`. No
-manual pumping.
-
-```ts
-import { GenServer, Supervisor, child, spawn, send, Task } from "allegro";
-
-const c = await Counter.start(0);
-c.cast("inc"); await c.call("get");                  // 1
-
-const sup = await Supervisor.start({ children: [child(Counter, 0)] });
-sup.whichChildren();                                 // restarted on crash
-
-await Task.parallel([() => work(1), () => work(2)]); // green-thread fan-out
-```
-
-- **GenServer** — `init` / `handleCast` / `handleCall` (`reply(value, state)`);
-  `.start` / `.call` / `.cast` / `.stop`.
-- **Supervisor** — child specs + `one_for_one` restart with a budget.
-- **Registry** — `register` / `whereis`; `send`/`monitor` take a pid or a name.
-- **Task** — `async` / `await` / `parallel`.
-- Bare actors — `spawn(handler, state)` + `send`; `monitor` delivers exits.
+All three consume the **same lifecycle event stream** (`agentStart`/`agentFinish`/
+`preToolUse`/`postToolUse`/`nodeEnter`/`nodeExit`/`command`/`stop`/`log`) — the CLI
+prints it, the TUI (Ink) and web (React) render it. It is also the substrate
+hooks fire on.
 
 ## Agentic primitives
 
@@ -104,13 +95,13 @@ await bot.fanOut(["a", "b"]);                         // concurrent, in order
 
 Agents run a tool-calling loop over the OpenAI Chat Completions API. `model:`
 defaults to the `MODEL` env var (else `gpt-4o-mini`); set `OPENAI_API_KEY`.
-Memory adds built-in `remember`/`recall` tools. A **Graph** routes between
-agents; a **Subagent** is a delegate.
+Memory adds built-in `remember`/`recall` tools. Tool calls pass through
+`preToolUse`/`postToolUse` hooks, which can block or replace them.
 
 ## CLI
 
 ```
-allegro run <spec.ts|spec.json> [--events]
+allegro run <spec.ts|spec.json> [--events] [--command <name>] [--input <s>]
 allegro tui <spec.ts>
 allegro web <spec.ts> [--port <n>]
 allegro help
@@ -120,16 +111,16 @@ allegro help
 
 ```bash
 bun run build        # -> ./allegro  (self-contained; run/tui/web all work)
-./allegro run examples/counter.ts
+./allegro run examples/pipeline.ts
 ```
 
 ## Layout
 
 ```
-src/otp/      process runtime: runtime, genserver, supervisor, registry, task
-src/agents/   agent, tool, memory, subagent, graph, message, openai
-src/spec/     defineSystem + types, build/run/load
-src/ui/       shared view-model (event format + process table)
+src/runtime/  the event bus (observability + hook dispatch/gating)
+src/agents/   agent, tool, memory, graph, mcp, message, openai
+src/spec/     defineSystem + node types, build/run/load
+src/ui/       shared view-model (event format + node table)
 src/cli/      headless entry
 src/tui/      Ink app
 src/web/      Bun.serve + React client
@@ -140,6 +131,6 @@ test/         bun test
 ## Test
 
 ```bash
-bun test          # OTP, agents (mocked OpenAI), spec, TUI, web
+bun test          # agents (mocked OpenAI), spec, TUI, web
 bun run typecheck # tsc --noEmit
 ```

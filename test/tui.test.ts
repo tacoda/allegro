@@ -2,20 +2,19 @@ import { expect, test, beforeEach } from "bun:test";
 import React from "react";
 import { render } from "ink-testing-library";
 import { App } from "../src/tui/app.tsx";
-import { runtime } from "../src/otp/index.ts";
+import { bus } from "../src/runtime/bus.ts";
 
-beforeEach(() => runtime.reset());
+beforeEach(() => bus.reset());
 
-const tick = (ms = 40) => new Promise((r) => setTimeout(r, ms));
+const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
 
-test("TUI renders the process table, events, and spec output", async () => {
-  const { lastFrame } = render(React.createElement(App, { file: "examples/supervisor.ts" }));
+test("TUI renders the node table, events, and spec output", async () => {
+  const { lastFrame } = render(React.createElement(App, { file: "examples/pipeline.ts" }));
   await tick();
   const frame = lastFrame() ?? "";
   expect(frame).toContain("allegro");
-  expect(frame).toContain("processes");
+  expect(frame).toContain("nodes");
   expect(frame).toContain("events");
-  // the supervisor spec restarts a worker and prints its id
-  expect(frame).toContain("restart");
-  expect(frame).toContain("after:");
+  // the offline pipeline branches to "big" then "small"
+  expect(frame).toContain("big");
 });
